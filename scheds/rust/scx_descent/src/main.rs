@@ -150,6 +150,17 @@ Key features:
 - Three optimization profiles: gaming, productivity, server
 - Safety mechanisms to prevent parameter oscillation
 - Deterministic control without random exploration
+
+SCX_DESCENT_TURBO Environment Variable:
+  Processes with SCX_DESCENT_TURBO=1 receive the highest scheduling priority:
+  - Automatically classified as LATENCY_CRITICAL
+  - Receive half the normal time slice for faster scheduling
+  - Get earlier deadlines (higher priority within their class)
+  - Non-turbo tasks on SMT siblings are migrated away or deprioritized
+  
+  Usage: SCX_DESCENT_TURBO=1 ./your_benchmark
+  
+  This is detected automatically by scanning /proc every 5 seconds.
 "#
 )]
 struct Opts {
@@ -776,6 +787,69 @@ impl<'a> Scheduler<'a> {
         audio_tgids.into_iter().collect()
     }
 
+    /// Detect processes with SCX_DESCENT_TURBO=1 environment variable
+    ///
+    /// Scans /proc for processes with the SCX_DESCENT_TURBO environment variable
+    /// set to a non-empty, non-zero value. Returns a list of TGIDs that should
+    /// receive turbo scheduling priority.
+    fn detect_turbo_processes(&self) -> Vec<u32> {
+        let mut turbo_tgids = Vec::new();
+
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name();
+                let pid_str = file_name.to_string_lossy();
+
+                // Only process numeric entries (PIDs)
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    // Check /proc/PID/environ for SCX_DESCENT_TURBO
+                    if let Ok(environ) = fs::read(format!("/proc/{}/environ", pid)) {
+                        let is_turbo = environ
+                            .split(|&b| b == 0) // Environment vars are null-delimited
+                            .filter_map(|kv| std::str::from_utf8(kv).ok())
+                            .any(|s| {
+                                // Check for SCX_DESCENT_TURBO= with non-empty, non-zero value
+                                if let Some(value) = s.strip_prefix("SCX_DESCENT_TURBO=") {
+                                    !value.is_empty() && value != "0"
+                                } else {
+                                    false
+                                }
+                            });
+
+                        if is_turbo {
+                            // Get TGID from /proc/PID/status
+                            if let Some(tgid) = Self::get_tgid_from_status(pid) {
+                                // Avoid duplicates
+                                if !turbo_tgids.contains(&tgid) {
+                                    turbo_tgids.push(tgid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Limit to 16 entries to match BPF array size
+        turbo_tgids.truncate(16);
+        turbo_tgids
+    }
+
+    /// Helper to read TGID from /proc/PID/status
+    ///
+    /// The TGID (Thread Group ID) is the PID of the thread group leader.
+    /// All threads in a process share the same TGID.
+    fn get_tgid_from_status(pid: u32) -> Option<u32> {
+        if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
+            for line in status.lines() {
+                if line.starts_with("Tgid:") {
+                    return line.split_whitespace().nth(1).and_then(|t| t.parse().ok());
+                }
+            }
+        }
+        None
+    }
+
     /// Detect game process via Steam envvar or Wine exe
     fn detect_game_process(&self) -> Option<(u32, u32, u8)> {
         // Scan /proc for game indicators
@@ -900,6 +974,26 @@ impl<'a> Scheduler<'a> {
             bss_data.nr_audio_tgids = nr_audio as u32;
             for (i, &tgid) in audio_tgids.iter().take(16).enumerate() {
                 bss_data.audio_tgids[i] = tgid;
+            }
+        }
+    }
+
+    /// Update BPF turbo process tracking
+    ///
+    /// Writes the list of turbo TGIDs to the BPF BSS section, enabling
+    /// the BPF scheduler to identify and prioritize turbo tasks.
+    fn update_bpf_turbo_tgids(&mut self, turbo_tgids: &[u32]) {
+        if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
+            let nr_turbo = turbo_tgids.len().min(16);
+            bss_data.nr_turbo_tgids = nr_turbo as u32;
+
+            for (i, &tgid) in turbo_tgids.iter().take(16).enumerate() {
+                bss_data.turbo_tgids[i] = tgid;
+            }
+
+            // Clear remaining slots
+            for i in nr_turbo..16 {
+                bss_data.turbo_tgids[i] = 0;
             }
         }
     }
@@ -1178,6 +1272,7 @@ impl<'a> Scheduler<'a> {
         let mut current_game: Option<(u32, u32, u8)>;
         let mut current_audio_tgids: Vec<u32>;
         let mut current_state: u32 = 0;
+        let mut last_turbo_tgids: Vec<u32> = Vec::new();
 
         // Perform initial detection
         current_audio_tgids = self.detect_audio_daemons();
@@ -1211,6 +1306,25 @@ impl<'a> Scheduler<'a> {
                 // Re-detect audio daemons periodically
                 current_audio_tgids = self.detect_audio_daemons();
                 self.update_bpf_audio_tgids(&current_audio_tgids);
+
+                // Detect turbo processes
+                let turbo_tgids = self.detect_turbo_processes();
+
+                // Log changes in turbo mode status
+                if turbo_tgids != last_turbo_tgids {
+                    if !turbo_tgids.is_empty() {
+                        info!(
+                            "Turbo mode active for {} process(es): {:?}",
+                            turbo_tgids.len(),
+                            turbo_tgids
+                        );
+                    } else if !last_turbo_tgids.is_empty() {
+                        info!("Turbo mode deactivated");
+                    }
+                    last_turbo_tgids = turbo_tgids.clone();
+                }
+
+                self.update_bpf_turbo_tgids(&turbo_tgids);
 
                 // Detect game process
                 current_game = self.detect_game_process();

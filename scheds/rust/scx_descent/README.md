@@ -209,6 +209,35 @@ sudo scx_descent --stats 1
 scx_descent --monitor 1
 ```
 
+### SCX_DESCENT_TURBO Environment Variable
+
+scx_descent automatically detects processes with the `SCX_DESCENT_TURBO` environment variable set to a non-empty, non-zero value. These processes receive the highest scheduling priority:
+
+- **Automatic classification**: Turbo processes are always classified as `LATENCY_CRITICAL`
+- **Reduced time slices**: Turbo tasks receive half the normal slice for faster preemption
+- **Deadline boost**: Earlier virtual deadlines (higher priority within their class)
+- **SMT conflict avoidance**: Non-turbo tasks on SMT siblings of turbo tasks are migrated away or deprioritized with additional vruntime penalties
+
+**Usage:**
+
+```bash
+# Run a single command with turbo priority
+SCX_DESCENT_TURBO=1 ./benchmark
+
+# Export for multiple commands
+export SCX_DESCENT_TURBO=1
+./app1 &
+./app2 &
+```
+
+**How it works:**
+- The scheduler scans `/proc/*/environ` every 5 seconds
+- Processes with `SCX_DESCENT_TURBO=1` (or any non-zero value) are identified
+- All threads in the process (matching TGID) receive turbo priority
+- Changes are applied dynamically without restarting the scheduler
+
+This is ideal for benchmarks, real-time applications, or any workload that needs guaranteed low latency regardless of system load.
+
 ## Profile Configuration
 
 | Profile | Response | Alpha | Beta | Use Case |

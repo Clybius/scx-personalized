@@ -25,6 +25,12 @@
 #define BIT_KTHREAD 23 /* Cached PF_KTHREAD from task flags */
 
 /*
+ * Bit position for turbo task flag in task_ctx->packed
+ * Turbo tasks get highest priority scheduling
+ */
+#define BIT_TURBO 22 /* Task is a turbo-boosted process */
+
+/*
  * Task classification thresholds
  */
 #define WAKEUP_FREQ_INTERACTIVE_THRESH 1000
@@ -138,12 +144,19 @@ static volatile u8 cpus_throttled;
  * State machine variables - written by userspace, read by BPF
  * These need to be volatile since they're modified from userspace
  */
-volatile u32	 game_tgid; // Game process TGID
-volatile u32	 game_ppid; // Parent PID for Wine/Proton family
-volatile u8	 game_confidence; // 100=Steam, 90=Wine, 0=none
-volatile u32	 sched_state; // 0=IDLE, 1=COMPILATION, 2=GAMING
-volatile u32	 audio_tgids[16]; // Protected audio daemon TGIDs
-volatile u32	 nr_audio_tgids; // Number of valid audio TGIDs
+volatile u32 game_tgid; // Game process TGID
+volatile u32 game_ppid; // Parent PID for Wine/Proton family
+volatile u8  game_confidence; // 100=Steam, 90=Wine, 0=none
+volatile u32 sched_state; // 0=IDLE, 1=COMPILATION, 2=GAMING
+volatile u32 audio_tgids[16]; // Protected audio daemon TGIDs
+volatile u32 nr_audio_tgids; // Number of valid audio TGIDs
+
+/*
+ * Turbo process tracking - processes with SCX_DESCENT_TURBO env var get
+ * highest priority scheduling
+ */
+volatile u32	 turbo_tgids[16]; // Turbo process TGIDs (array)
+volatile u32	 nr_turbo_tgids; // Number of valid turbo TGIDs
 
 static inline u8 is_throttled(void)
 {
@@ -731,12 +744,57 @@ static inline u64 task_slice(const struct task_struct *p, struct task_ctx *tctx)
 }
 
 /*
+ * Forward declaration for SMT sibling lookup (defined later in file)
+ */
+static inline s32 smt_sibling(s32 cpu);
+
+/*
+ * Check if a task's TGID is in the turbo list.
+ */
+static inline u8 is_turbo_tgid(u32 task_tgid)
+{
+	if (nr_turbo_tgids == 0)
+		return 0;
+
+#pragma unroll
+	for (u32 i = 0; i < 16; i++) {
+		if (i >= nr_turbo_tgids)
+			break;
+		if (task_tgid == turbo_tgids[i])
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Check if the SMT sibling of the given CPU is running a turbo task.
+ */
+static inline u8 is_sibling_turbo_task(s32 cpu)
+{
+	s32		    sibling_cpu;
+	struct task_struct *sibling_task;
+
+	if (!smt_enabled)
+		return 0;
+
+	sibling_cpu = smt_sibling(cpu);
+	if (sibling_cpu == cpu)
+		return 0;
+
+	sibling_task = __COMPAT_scx_bpf_cpu_curr(sibling_cpu);
+	if (!sibling_task || sibling_task->flags & PF_IDLE)
+		return 0;
+
+	return is_turbo_tgid(sibling_task->tgid);
+}
+
+/*
  * Classify a task into one of the descent classes using scx_cake methodology.
  * Classification runs every 64th stop for efficiency.
  *
  * Class 0: LATENCY_CRITICAL - Games, audio, compositors, kthreads (during GAMING)
  * Class 1: NORMAL          - Default interactive
- * Class 2: HOG             - High CPU usage (≥75% quantum)
+ * Class 2: HOG             - High CPU usage (>=75% quantum)
  * Class 3: BACKGROUND      - Low priority, SCHED_IDLE, rare wakeups
  *
  * Default: NORMAL
@@ -793,6 +851,13 @@ static u32 classify_task(struct task_struct *p, struct task_ctx *tctx)
 					goto done;
 				}
 			}
+		}
+
+		/* Turbo process matching - highest priority */
+		if (nr_turbo_tgids > 0 && is_turbo_tgid(p->tgid)) {
+			class = DESCENT_CLASS_LATENCY_CRITICAL;
+			tctx->packed |= (1 << BIT_TURBO);
+			goto done;
 		}
 
 		/* Class 2: HOG (high CPU usage, non-critical) */
@@ -1050,6 +1115,24 @@ static u64 task_dl(struct task_struct *p, struct task_ctx *tctx, u64 enq_flags)
 	    tctx->slice_ns_ewma < cp->preemption_priority)
 		scaled_vtime += cp->latency_weight;
 
+	/*
+	 * Turbo task deadline boost: turbo tasks get earlier deadlines
+	 * for faster scheduling within LATENCY_CRITICAL class
+	 */
+	if (is_turbo_tgid(p->tgid)) {
+		/* Reduce deadline by latency_weight for turbo boost */
+		if (scaled_vtime > cp->latency_weight)
+			scaled_vtime -= cp->latency_weight;
+	}
+
+	/*
+	 * Turbo conflict penalty: tasks on SMT siblings of turbo tasks
+	 * get deprioritized with additional vruntime
+	 */
+	if (is_sibling_turbo_task(scx_bpf_task_cpu(p))) {
+		scaled_vtime += cp->latency_weight;
+	}
+
 	return scaled_vtime;
 }
 
@@ -1127,6 +1210,28 @@ s32 BPF_STRUCT_OPS(descent_select_cpu, struct task_struct *p, s32 prev_cpu,
 		update_classification_momentum(p, tctx);
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
+
+	/*
+	 * If this task is NOT a turbo task but prev_cpu has a turbo task
+	 * on its SMT sibling, try to migrate away to avoid contention.
+	 */
+	if (tctx && !is_turbo_tgid(p->tgid) &&
+	    is_sibling_turbo_task(prev_cpu)) {
+		/* Try to find a non-contended idle CPU */
+		if (!is_pcpu_task(p)) {
+			s32 new_cpu = pick_idle_cpu(p, prev_cpu, wake_flags,
+						    &is_idle);
+			if (is_idle && new_cpu != prev_cpu) {
+				/* Migrate away from turbo task's SMT sibling */
+				scx_bpf_dsq_insert(p,
+						   SCX_DSQ_LOCAL_ON | new_cpu,
+						   task_slice(p, tctx), 0);
+				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
+				return new_cpu;
+			}
+		}
+	}
+
 	if (rr_sched || is_idle) {
 		if (tctx)
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
@@ -1333,6 +1438,22 @@ void BPF_STRUCT_OPS(descent_enqueue, struct task_struct *p, u64 enq_flags)
 	tctx = try_lookup_task_ctx(p);
 	if (tctx) {
 		tctx->enqueue_time_ns = bpf_ktime_get_ns();
+
+		/*
+		 * For turbo tasks: use reduced slice for faster preemption decisions
+		 */
+		if (is_turbo_tgid(p->tgid)) {
+			struct class_params *cp =
+				get_class_params_for_scheduling(
+					tctx->task_class);
+			if (cp) {
+				/* Turbo tasks get half the normal slice for responsiveness */
+				u64 turbo_slice = cp->base_slice_ns / 2;
+
+				/* Update task slice for this enqueue */
+				p->scx.slice = turbo_slice;
+			}
+		}
 	}
 
 	/*
@@ -1400,6 +1521,22 @@ static u8 keep_running(const struct task_struct *p, s32 cpu)
 	 */
 	if (is_smt_contended(cpu))
 		return 0;
+
+	/*
+	 * If a turbo task is running on SMT sibling, yield immediately.
+	 * Non-turbo tasks should not contend with turbo tasks.
+	 */
+	if (is_sibling_turbo_task(cpu)) {
+		return 0;
+	}
+
+	/*
+	 * If this IS a turbo task and there's work waiting, keep running.
+	 * Turbo tasks are sticky to maintain low latency.
+	 */
+	if (is_turbo_tgid(p->tgid) && is_queued(p)) {
+		return 1;
+	}
 
 	return 1;
 }
