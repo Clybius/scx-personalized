@@ -20,6 +20,11 @@
 #define SLICE_MIN_NS (10ULL * NSEC_PER_USEC)
 
 /*
+ * Bit position for cached kthread flag in task_ctx->packed
+ */
+#define BIT_KTHREAD 23 /* Cached PF_KTHREAD from task flags */
+
+/*
  * Task classification thresholds
  */
 #define WAKEUP_FREQ_INTERACTIVE_THRESH 1000
@@ -126,18 +131,29 @@ static u64 nr_cpu_ids;
  *
  * Throttle the CPUs by injecting @throttle_ns idle time every @slice_max.
  */
-const volatile u64   throttle_ns;
-static volatile bool cpus_throttled;
+const volatile u64 throttle_ns;
+static volatile u8 cpus_throttled;
 
-static inline bool   is_throttled(void)
+/*
+ * State machine variables - written by userspace, read by BPF
+ * These need to be volatile since they're modified from userspace
+ */
+volatile u32	 game_tgid; // Game process TGID
+volatile u32	 game_ppid; // Parent PID for Wine/Proton family
+volatile u8	 game_confidence; // 100=Steam, 90=Wine, 0=none
+volatile u32	 sched_state; // 0=IDLE, 1=COMPILATION, 2=GAMING
+volatile u32	 audio_tgids[16]; // Protected audio daemon TGIDs
+volatile u32	 nr_audio_tgids; // Number of valid audio TGIDs
+
+static inline u8 is_throttled(void)
 {
 	if (!throttle_ns)
-		return false;
+		return 0;
 
-	return READ_ONCE(cpus_throttled);
+	return READ_ONCE(cpus_throttled) ? 1 : 0;
 }
 
-static inline void set_throttled(bool state)
+static inline void set_throttled(u8 state)
 {
 	WRITE_ONCE(cpus_throttled, state);
 }
@@ -229,7 +245,22 @@ struct {
 } cpu_ctx_stor SEC(".maps");
 
 /*
- * Per-CPU descent context map
+ * Syscall-accessible class parameters map.
+ * Uses a regular ARRAY map (not PERCPU) so it can be accessed from syscall programs.
+ * Indexed by: cpu_id * DESCENT_CLASS_MAX + class_id
+ */
+#define MAX_CPUS 1024
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_CPUS *DESCENT_CLASS_MAX);
+	__type(key, u32);
+	__type(value, struct class_params);
+} class_params_stor SEC(".maps");
+
+/*
+ * Per-CPU descent context map - kept for loss accumulators and other per-CPU state.
+ * Note: syscall programs cannot use bpf_map_lookup_percpu_elem on this.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -237,28 +268,6 @@ struct {
 	__type(key, u32);
 	__type(value, struct cpu_descent_ctx);
 } cpu_descent_ctx_stor SEC(".maps");
-
-/*
- * Timer used to inject perturbations for gradient estimation.
- */
-struct perturb_timer {
-	struct bpf_timer timer;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, u32);
-	__type(value, struct perturb_timer);
-} perturb_timer SEC(".maps");
-
-/*
- * Ring buffer for gradient events to userspace.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 256 * 1024); /* 256KB buffer */
-} gradient_events SEC(".maps");
 
 /*
  * Return a CPU context.
@@ -279,45 +288,43 @@ struct cpu_descent_ctx *try_lookup_cpu_descent_ctx(void)
 }
 
 /*
- * Parameter helper functions for perturbation
+ * Parameter helper function: read parameters from syscall-accessible map
+ * Key is computed as: cpu * DESCENT_CLASS_MAX + class_id
  */
-static u64 get_param_value(struct class_params *cp, s32 idx)
+static u32 params_key(u32 cpu, u32 class_id)
 {
-	switch (idx) {
-	case 0:
-		return cp->latency_weight;
-	case 1:
-		return cp->base_slice_ns;
-	case 2:
-		return cp->vruntime_scale;
-	case 3:
-		return cp->preemption_priority;
-	case 4:
-		return cp->migration_cost;
-	default:
-		return 0;
-	}
+	return cpu * DESCENT_CLASS_MAX + class_id;
 }
 
-static void set_param_value(struct class_params *cp, s32 idx, u64 value)
+/*
+ * Parameter helper function: read parameters from class_params_stor map
+ * or fall back to default per-CPU params.
+ * Also tracks last_param_sync timestamp when reading from syscall-accessible map.
+ */
+static struct class_params *get_class_params_for_scheduling(u32 class_id)
 {
-	switch (idx) {
-	case 0:
-		cp->latency_weight = value;
-		break;
-	case 1:
-		cp->base_slice_ns = value;
-		break;
-	case 2:
-		cp->vruntime_scale = value;
-		break;
-	case 3:
-		cp->preemption_priority = value;
-		break;
-	case 4:
-		cp->migration_cost = value;
-		break;
+	struct class_params    *cp;
+	struct cpu_descent_ctx *cdctx;
+	s32			cpu = bpf_get_smp_processor_id();
+	u32			key = params_key(cpu, class_id);
+
+	/* Try syscall-accessible map first */
+	cp = bpf_map_lookup_elem(&class_params_stor, &key);
+	if (cp) {
+		/* Track that we've read updated params - helps userspace correlate loss with params */
+		cdctx = try_lookup_cpu_descent_ctx();
+		if (cdctx)
+			cdctx->last_param_sync = bpf_ktime_get_ns();
+		return cp;
 	}
+
+	/* Fallback to default params from per-CPU context */
+	cdctx = try_lookup_cpu_descent_ctx();
+	if (cdctx && class_id < DESCENT_CLASS_MAX) {
+		return &cdctx->class_params[class_id];
+	}
+
+	return NULL;
 }
 
 static u64 clamp_param_value(s32 idx, u64 value)
@@ -343,170 +350,128 @@ static u64 clamp_param_value(s32 idx, u64 value)
 	}
 }
 
-static void apply_perturbation(struct class_params *cp, s32 idx, s64 delta)
-{
-	u64 current = get_param_value(cp, idx);
-	u64 new_val;
-
-	if (delta < 0 && current < (u64)(-delta))
-		new_val = 0;
-	else
-		new_val = (s64)current + delta;
-
-	/* Apply bounds */
-	new_val = clamp_param_value(idx, new_val);
-	set_param_value(cp, idx, new_val);
-}
-
-static u64 calculate_epsilon(struct class_params *cp, s32 idx)
-{
-	/* Adaptive epsilon: 5% perturbation */
-	u64 base    = get_param_value(cp, idx);
-	u64 epsilon = base / 20;
-
-	/* Minimum epsilon to ensure measurable effect */
-	u64 min_epsilon = 1;
-	if (idx == 0 || idx == 1 || idx == 4) {
-		/* Time-based parameters: 100us minimum */
-		min_epsilon = 100 * NSEC_PER_USEC;
-	} else if (idx == 2) {
-		/* Vruntime scale: 10 minimum */
-		min_epsilon = 10;
-	} else if (idx == 3) {
-		/* Preemption priority: 1 minimum */
-		min_epsilon = 1;
-	}
-
-	if (epsilon < min_epsilon)
-		epsilon = min_epsilon;
-
-	return epsilon;
-}
-
-static u64 read_accumulated_loss(struct cpu_descent_ctx *cdctx, u32 class_id)
-{
-	if (class_id >= DESCENT_CLASS_MAX)
-		return 0;
-
-	struct class_loss_accumulator *accum = &cdctx->class_loss[class_id];
-
-	/* Compute composite loss: latency + deadline misses */
-	u64 loss = accum->latency_loss_sum;
-	if (accum->sample_count > 0)
-		loss = loss / accum->sample_count;
-
-	/* Add penalty for deadline misses */
-	loss += accum->deadline_misses * NSEC_PER_MSEC;
-
-	return loss;
-}
-
-static void reset_loss_accumulator(struct cpu_descent_ctx *cdctx, u32 class_id)
-{
-	if (class_id >= DESCENT_CLASS_MAX)
-		return;
-
-	struct class_loss_accumulator *accum = &cdctx->class_loss[class_id];
-	accum->latency_loss_sum		     = 0;
-	accum->deadline_misses		     = 0;
-	accum->cpu_time_ns		     = 0;
-	accum->sample_count		     = 0;
-}
-
-static void send_gradient_ready_event(s32 cpu, u32 class_id, s32 param_idx,
-				      u64 loss_plus, u64 loss_minus, u64 eps)
-{
-	struct gradient_ready_event *e =
-		bpf_ringbuf_reserve(&gradient_events, sizeof(*e), 0);
-	if (!e)
-		return;
-
-	e->cpu_id     = cpu;
-	e->class_id   = class_id;
-	e->param_idx  = param_idx;
-	e->loss_plus  = loss_plus;
-	e->loss_minus = loss_minus;
-	e->epsilon    = eps;
-	e->timestamp  = bpf_ktime_get_ns();
-
-	bpf_ringbuf_submit(e, 0);
-}
-
 /*
  * Initialize class parameters with defaults
  */
 static void init_class_params(struct cpu_descent_ctx *cdctx)
 {
-	/* Interactive */
-	cdctx->class_params[DESCENT_CLASS_INTERACTIVE].latency_weight =
-		INTERACTIVE_LATENCY_WEIGHT_NS;
-	cdctx->class_params[DESCENT_CLASS_INTERACTIVE].base_slice_ns =
-		INTERACTIVE_BASE_SLICE_NS;
-	cdctx->class_params[DESCENT_CLASS_INTERACTIVE].vruntime_scale =
-		INTERACTIVE_VRUNTIME_SCALE;
-	cdctx->class_params[DESCENT_CLASS_INTERACTIVE].preemption_priority =
-		INTERACTIVE_PREEMPTION_PRIORITY;
-	cdctx->class_params[DESCENT_CLASS_INTERACTIVE].migration_cost =
-		INTERACTIVE_MIGRATION_COST_NS;
+	/* LATENCY_CRITICAL (Class 0): Games, audio, compositors, kthreads */
+	cdctx->class_params[DESCENT_CLASS_LATENCY_CRITICAL].latency_weight =
+		LATENCY_CRITICAL_LATENCY_WEIGHT_NS;
+	cdctx->class_params[DESCENT_CLASS_LATENCY_CRITICAL].base_slice_ns =
+		LATENCY_CRITICAL_BASE_SLICE_NS;
+	cdctx->class_params[DESCENT_CLASS_LATENCY_CRITICAL].vruntime_scale =
+		LATENCY_CRITICAL_VRUNTIME_SCALE;
+	cdctx->class_params[DESCENT_CLASS_LATENCY_CRITICAL].preemption_priority =
+		LATENCY_CRITICAL_PREEMPTION_PRIORITY;
+	cdctx->class_params[DESCENT_CLASS_LATENCY_CRITICAL].migration_cost =
+		LATENCY_CRITICAL_MIGRATION_COST_NS;
 
-	/* Audio */
-	cdctx->class_params[DESCENT_CLASS_AUDIO].latency_weight =
-		AUDIO_LATENCY_WEIGHT_NS;
-	cdctx->class_params[DESCENT_CLASS_AUDIO].base_slice_ns =
-		AUDIO_BASE_SLICE_NS;
-	cdctx->class_params[DESCENT_CLASS_AUDIO].vruntime_scale =
-		AUDIO_VRUNTIME_SCALE;
-	cdctx->class_params[DESCENT_CLASS_AUDIO].preemption_priority =
-		AUDIO_PREEMPTION_PRIORITY;
-	cdctx->class_params[DESCENT_CLASS_AUDIO].migration_cost =
-		AUDIO_MIGRATION_COST_NS;
+	/* NORMAL (Class 1): Default interactive */
+	cdctx->class_params[DESCENT_CLASS_NORMAL].latency_weight =
+		NORMAL_LATENCY_WEIGHT_NS;
+	cdctx->class_params[DESCENT_CLASS_NORMAL].base_slice_ns =
+		NORMAL_BASE_SLICE_NS;
+	cdctx->class_params[DESCENT_CLASS_NORMAL].vruntime_scale =
+		NORMAL_VRUNTIME_SCALE;
+	cdctx->class_params[DESCENT_CLASS_NORMAL].preemption_priority =
+		NORMAL_PREEMPTION_PRIORITY;
+	cdctx->class_params[DESCENT_CLASS_NORMAL].migration_cost =
+		NORMAL_MIGRATION_COST_NS;
 
-	/* Batch */
-	cdctx->class_params[DESCENT_CLASS_BATCH].latency_weight =
-		BATCH_LATENCY_WEIGHT_NS;
-	cdctx->class_params[DESCENT_CLASS_BATCH].base_slice_ns =
-		BATCH_BASE_SLICE_NS;
-	cdctx->class_params[DESCENT_CLASS_BATCH].vruntime_scale =
-		BATCH_VRUNTIME_SCALE;
-	cdctx->class_params[DESCENT_CLASS_BATCH].preemption_priority =
-		BATCH_PREEMPTION_PRIORITY;
-	cdctx->class_params[DESCENT_CLASS_BATCH].migration_cost =
-		BATCH_MIGRATION_COST_NS;
+	/* HOG (Class 2): High CPU usage */
+	cdctx->class_params[DESCENT_CLASS_HOG].latency_weight =
+		HOG_LATENCY_WEIGHT_NS;
+	cdctx->class_params[DESCENT_CLASS_HOG].base_slice_ns =
+		HOG_BASE_SLICE_NS;
+	cdctx->class_params[DESCENT_CLASS_HOG].vruntime_scale =
+		HOG_VRUNTIME_SCALE;
+	cdctx->class_params[DESCENT_CLASS_HOG].preemption_priority =
+		HOG_PREEMPTION_PRIORITY;
+	cdctx->class_params[DESCENT_CLASS_HOG].migration_cost =
+		HOG_MIGRATION_COST_NS;
 
-	/* Kernel */
-	cdctx->class_params[DESCENT_CLASS_KERNEL].latency_weight =
-		KERNEL_LATENCY_WEIGHT_NS;
-	cdctx->class_params[DESCENT_CLASS_KERNEL].base_slice_ns =
-		KERNEL_BASE_SLICE_NS;
-	cdctx->class_params[DESCENT_CLASS_KERNEL].vruntime_scale =
-		KERNEL_VRUNTIME_SCALE;
-	cdctx->class_params[DESCENT_CLASS_KERNEL].preemption_priority =
-		KERNEL_PREEMPTION_PRIORITY;
-	cdctx->class_params[DESCENT_CLASS_KERNEL].migration_cost =
-		KERNEL_MIGRATION_COST_NS;
+	/* BACKGROUND (Class 3): Low priority */
+	cdctx->class_params[DESCENT_CLASS_BACKGROUND].latency_weight =
+		BACKGROUND_LATENCY_WEIGHT_NS;
+	cdctx->class_params[DESCENT_CLASS_BACKGROUND].base_slice_ns =
+		BACKGROUND_BASE_SLICE_NS;
+	cdctx->class_params[DESCENT_CLASS_BACKGROUND].vruntime_scale =
+		BACKGROUND_VRUNTIME_SCALE;
+	cdctx->class_params[DESCENT_CLASS_BACKGROUND].preemption_priority =
+		BACKGROUND_PREEMPTION_PRIORITY;
+	cdctx->class_params[DESCENT_CLASS_BACKGROUND].migration_cost =
+		BACKGROUND_MIGRATION_COST_NS;
 
-	cdctx->last_param_sync		  = bpf_ktime_get_ns();
-	cdctx->current_perturbation_start = 0;
+	cdctx->last_param_sync = bpf_ktime_get_ns();
 
-	/* Initialize perturbation state for all classes */
+	/* Initialize loss accumulators for all classes */
 	for (int i = 0; i < DESCENT_CLASS_MAX; i++) {
-		/* Initialize loss accumulators */
 		cdctx->class_loss[i].latency_loss_sum = 0;
 		cdctx->class_loss[i].deadline_misses  = 0;
 		cdctx->class_loss[i].cpu_time_ns      = 0;
 		cdctx->class_loss[i].target_share_ns  = 0;
 		cdctx->class_loss[i].sample_count     = 0;
-		cdctx->class_loss[i].active	      = false;
-
-		/* Initialize baseline loss storage */
-		cdctx->loss_baseline[i] = 0;
 	}
+}
 
-	/* Initialize perturbation state machine */
-	cdctx->perturb.param_idx      = 0;
-	cdctx->perturb.phase	      = PERTURB_BASELINE;
-	cdctx->perturb.phase_start_ns = 0;
-	cdctx->perturb.current_class  = 0;
+/*
+ * Helper to set default values in class_params_stor for a given CPU and class.
+ */
+static void init_class_params_stor(u32 cpu, u32 class_id,
+				   struct class_params *defaults)
+{
+	struct class_params *cp;
+	u32		     key = params_key(cpu, class_id);
+
+	cp = bpf_map_lookup_elem(&class_params_stor, &key);
+	if (cp) {
+		cp->latency_weight	= defaults->latency_weight;
+		cp->base_slice_ns	= defaults->base_slice_ns;
+		cp->vruntime_scale	= defaults->vruntime_scale;
+		cp->preemption_priority = defaults->preemption_priority;
+		cp->migration_cost	= defaults->migration_cost;
+	}
+}
+
+/*
+ * Initialize syscall-accessible class parameters for a CPU.
+ */
+static void init_cpu_class_params(u32 cpu)
+{
+	struct class_params defaults;
+
+	/* LATENCY_CRITICAL (Class 0) */
+	defaults.latency_weight	     = LATENCY_CRITICAL_LATENCY_WEIGHT_NS;
+	defaults.base_slice_ns	     = LATENCY_CRITICAL_BASE_SLICE_NS;
+	defaults.vruntime_scale	     = LATENCY_CRITICAL_VRUNTIME_SCALE;
+	defaults.preemption_priority = LATENCY_CRITICAL_PREEMPTION_PRIORITY;
+	defaults.migration_cost	     = LATENCY_CRITICAL_MIGRATION_COST_NS;
+	init_class_params_stor(cpu, DESCENT_CLASS_LATENCY_CRITICAL, &defaults);
+
+	/* NORMAL (Class 1) */
+	defaults.latency_weight	     = NORMAL_LATENCY_WEIGHT_NS;
+	defaults.base_slice_ns	     = NORMAL_BASE_SLICE_NS;
+	defaults.vruntime_scale	     = NORMAL_VRUNTIME_SCALE;
+	defaults.preemption_priority = NORMAL_PREEMPTION_PRIORITY;
+	defaults.migration_cost	     = NORMAL_MIGRATION_COST_NS;
+	init_class_params_stor(cpu, DESCENT_CLASS_NORMAL, &defaults);
+
+	/* HOG (Class 2) */
+	defaults.latency_weight	     = HOG_LATENCY_WEIGHT_NS;
+	defaults.base_slice_ns	     = HOG_BASE_SLICE_NS;
+	defaults.vruntime_scale	     = HOG_VRUNTIME_SCALE;
+	defaults.preemption_priority = HOG_PREEMPTION_PRIORITY;
+	defaults.migration_cost	     = HOG_MIGRATION_COST_NS;
+	init_class_params_stor(cpu, DESCENT_CLASS_HOG, &defaults);
+
+	/* BACKGROUND (Class 3) */
+	defaults.latency_weight	     = BACKGROUND_LATENCY_WEIGHT_NS;
+	defaults.base_slice_ns	     = BACKGROUND_BASE_SLICE_NS;
+	defaults.vruntime_scale	     = BACKGROUND_VRUNTIME_SCALE;
+	defaults.preemption_priority = BACKGROUND_PREEMPTION_PRIORITY;
+	defaults.migration_cost	     = BACKGROUND_MIGRATION_COST_NS;
+	init_class_params_stor(cpu, DESCENT_CLASS_BACKGROUND, &defaults);
 }
 
 /*
@@ -533,6 +498,11 @@ struct task_ctx {
 	u64 slice_ns_ewma;
 
 	/*
+	 * Current runtime in this scheduling cycle (for HOG detection).
+	 */
+	u64 runtime_ns;
+
+	/*
 	 * cgroup weight (cpu.weight).
 	 */
 	u32 cgweight;
@@ -543,6 +513,11 @@ struct task_ctx {
 	u32 task_class; /* Current assigned class */
 	u32 prev_class; /* Previous class (for hysteresis) */
 	u64 class_entry_time; /* When entered current class */
+	u32 reclassify_counter; /* Counts stops, classification every 64th */
+
+	/*
+	 * Classification metrics.
+	 */
 	struct {
 		u64 wakeup_latency_ewma;
 		u64 runtime_per_sched_ewma;
@@ -565,6 +540,17 @@ struct task_ctx {
 
 	/* Profile ID for thresholds */
 	u32 profile_id;
+
+	/*
+	 * Packed flags field:
+	 * Bit 23 (BIT_KTHREAD): Cached PF_KTHREAD from task flags
+	 */
+	u32 packed;
+
+	/*
+	 * PPID for Wine/Proton family detection.
+	 */
+	u32 ppid;
 };
 
 /* Map that contains task-local storage. */
@@ -617,17 +603,17 @@ static inline bool is_kthread(const struct task_struct *p)
 /*
  * Return true if @p can only run on a single CPU, false otherwise.
  */
-static bool is_pcpu_task(const struct task_struct *p)
+static u8 is_pcpu_task(const struct task_struct *p)
 {
-	return p->nr_cpus_allowed == 1 || is_migration_disabled(p);
+	return p->nr_cpus_allowed == 1 || is_migration_disabled(p) ? 1 : 0;
 }
 
 /*
  * Return true if @p still wants to run, false otherwise.
  */
-static bool is_queued(const struct task_struct *p)
+static u8 is_queued(const struct task_struct *p)
 {
-	return p->scx.flags & SCX_TASK_QUEUED;
+	return p->scx.flags & SCX_TASK_QUEUED ? 1 : 0;
 }
 
 /*
@@ -687,16 +673,15 @@ static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
  */
 static inline u64 task_slice(const struct task_struct *p, struct task_ctx *tctx)
 {
-	struct cpu_descent_ctx *cdctx;
-	u64			base_slice;
+	struct class_params *cp;
+	u64		     base_slice;
 
 	if (tickless_sched)
 		return SCX_SLICE_INF;
 
-	cdctx = try_lookup_cpu_descent_ctx();
-	if (cdctx && tctx->task_class < DESCENT_CLASS_MAX) {
-		base_slice =
-			cdctx->class_params[tctx->task_class].base_slice_ns;
+	cp = get_class_params_for_scheduling(tctx->task_class);
+	if (cp) {
+		base_slice = cp->base_slice_ns;
 		/* Scale by weight */
 		return scale_by_weight(p, base_slice);
 	}
@@ -705,39 +690,107 @@ static inline u64 task_slice(const struct task_struct *p, struct task_ctx *tctx)
 }
 
 /*
- * Classify a task into one of the descent classes.
+ * Classify a task into one of the descent classes using scx_cake methodology.
+ * Classification runs every 64th stop for efficiency.
  *
- * AUDIO: Real-time scheduling policy (SCHED_FIFO/SCHED_RR)
- * INTERACTIVE: High wakeup frequency AND short runtime slices
- * BATCH: Long slices AND low wakeup frequency
- * KERNEL: Kernel threads
- * Default: INTERACTIVE
+ * Class 0: LATENCY_CRITICAL - Games, audio, compositors, kthreads (during GAMING)
+ * Class 1: NORMAL          - Default interactive
+ * Class 2: HOG             - High CPU usage (≥75% quantum)
+ * Class 3: BACKGROUND      - Low priority, SCHED_IDLE, rare wakeups
+ *
+ * Default: NORMAL
  */
 static u32 classify_task(struct task_struct *p, struct task_ctx *tctx)
 {
-	/* Audio: Real-time policy */
-	if (p->policy == SCHED_FIFO || p->policy == SCHED_RR)
-		return DESCENT_CLASS_AUDIO;
+	u32 class = DESCENT_CLASS_NORMAL; /* Default */
 
-	/* Kernel: Kernel threads */
-	if (is_kthread(p))
-		return DESCENT_CLASS_KERNEL;
-
-	/* Use heuristics based on observed behavior */
-	if (tctx->slice_ns_ewma && tctx->wakeup_freq) {
-		/* Interactive: high wakeup freq + short slices */
-		if (tctx->wakeup_freq > WAKEUP_FREQ_INTERACTIVE_THRESH &&
-		    tctx->slice_ns_ewma < SLICE_NS_INTERACTIVE_THRESH)
-			return DESCENT_CLASS_INTERACTIVE;
-
-		/* Batch: low wakeup freq + long slices */
-		if (tctx->wakeup_freq < WAKEUP_FREQ_BATCH_THRESH &&
-		    tctx->slice_ns_ewma > SLICE_NS_BATCH_THRESH)
-			return DESCENT_CLASS_BATCH;
+	/* Increment counter, skip expensive classification on 63/64 stops */
+	tctx->reclassify_counter++;
+	if (tctx->reclassify_counter & 63) { /* Check lower 6 bits */
+		/* Fast path: return cached class if available */
+		if (tctx->task_class < DESCENT_CLASS_MAX)
+			return tctx->task_class;
+		/* No cache: fall through to classification */
 	}
 
-	/* Default to interactive for unknown behavior */
-	return DESCENT_CLASS_INTERACTIVE;
+	/* Check for real-time scheduling policies (always latency-critical) */
+	if (p->policy == SCHED_FIFO || p->policy == SCHED_RR) {
+		class = DESCENT_CLASS_LATENCY_CRITICAL;
+		goto done;
+	}
+
+	/* Check for SCHED_IDLE (always background) */
+	if (p->policy == SCHED_IDLE) {
+		class = DESCENT_CLASS_BACKGROUND;
+		goto done;
+	}
+
+	/* Only during GAMING state: full classification */
+	if (sched_state == 2) { /* GAMING */
+		u8 is_kthread_cached = (tctx->packed >> BIT_KTHREAD) & 1;
+
+		/* Class 0: LATENCY_CRITICAL */
+		/* Game family matching */
+		u8 is_game_family =
+			(p->tgid == game_tgid) || (tctx->ppid == game_ppid) ||
+			is_kthread_cached; /* Promote kthreads during gaming */
+
+		if (is_game_family) {
+			class = DESCENT_CLASS_LATENCY_CRITICAL;
+			goto done;
+		}
+
+		/* Audio daemon matching */
+		if (nr_audio_tgids > 0) {
+			u32 task_tgid = p->tgid;
+#pragma unroll
+			for (u32 i = 0; i < 16; i++) {
+				if (i >= nr_audio_tgids)
+					break;
+				if (task_tgid == audio_tgids[i]) {
+					class = DESCENT_CLASS_LATENCY_CRITICAL;
+					goto done;
+				}
+			}
+		}
+
+		/* Class 2: HOG (high CPU usage, non-critical) */
+		/* HOG detection: runtime >= 75% of typical slice */
+		u32 hog_thresh = (tctx->slice_ns_ewma >> 2) * 3; /* 75% */
+		if (!is_game_family && tctx->runtime_ns >= hog_thresh &&
+		    tctx->slice_ns_ewma > 0) {
+			class = DESCENT_CLASS_HOG;
+			goto done;
+		}
+
+		/* Class 3: BACKGROUND (rare wakeups, low activity) */
+		if (tctx->wakeup_freq < 10 &&
+		    tctx->slice_ns_ewma > 5 * NSEC_PER_MSEC) {
+			class = DESCENT_CLASS_BACKGROUND;
+			goto done;
+		}
+	}
+
+	/* Non-GAMING or fallback: use heuristics for NORMAL vs BACKGROUND */
+	if (tctx->slice_ns_ewma && tctx->wakeup_freq) {
+		/* High CPU usage tasks go to HOG */
+		u32 hog_thresh = (tctx->slice_ns_ewma >> 2) * 3;
+		if (tctx->runtime_ns >= hog_thresh && tctx->slice_ns_ewma > 0) {
+			class = DESCENT_CLASS_HOG;
+			goto done;
+		}
+
+		/* Background: low wakeup freq + long slices */
+		if (tctx->wakeup_freq < WAKEUP_FREQ_BATCH_THRESH &&
+		    tctx->slice_ns_ewma > SLICE_NS_BATCH_THRESH) {
+			class = DESCENT_CLASS_BACKGROUND;
+			goto done;
+		}
+	}
+
+done:
+	tctx->task_class = class;
+	return class;
 }
 
 /*
@@ -773,46 +826,65 @@ static void set_profile_thresholds(struct task_ctx *tctx, u32 profile_id)
 static void get_raw_votes(struct task_struct *p, struct task_ctx *tctx,
 			  u64 votes[DESCENT_CLASS_MAX])
 {
+	u8 is_kthread_cached;
+
 	/* Initialize all votes to 0 */
 	for (int i = 0; i < DESCENT_CLASS_MAX; i++) {
 		votes[i] = 0;
 	}
 
-	/* Audio: Real-time scheduling policy */
+	/* Real-time scheduling policy: always latency-critical */
 	if (p->policy == SCHED_FIFO || p->policy == SCHED_RR) {
-		votes[DESCENT_CLASS_AUDIO] = 100;
+		votes[DESCENT_CLASS_LATENCY_CRITICAL] = 100;
 		return;
 	}
 
-	/* Kernel: Kernel threads */
-	if (is_kthread(p)) {
-		votes[DESCENT_CLASS_KERNEL] = 100;
+	/* SCHED_IDLE: always background */
+	if (p->policy == SCHED_IDLE) {
+		votes[DESCENT_CLASS_BACKGROUND] = 100;
+		return;
+	}
+
+	/* Kernel threads: use cached flag */
+	is_kthread_cached = (tctx->packed >> BIT_KTHREAD) & 1;
+	if (is_kthread_cached) {
+		/* During gaming, kthreads are latency-critical, otherwise normal */
+		if (sched_state == 2) { /* GAMING */
+			votes[DESCENT_CLASS_LATENCY_CRITICAL] = 100;
+		} else {
+			votes[DESCENT_CLASS_NORMAL] = 100;
+		}
 		return;
 	}
 
 	/* Use heuristics based on observed behavior */
 	if (tctx->slice_ns_ewma && tctx->wakeup_freq) {
-		/* Interactive: high wakeup freq + short slices */
+		/* HOG: high CPU usage */
+		u32 hog_thresh = (tctx->slice_ns_ewma >> 2) * 3;
+		if (tctx->runtime_ns >= hog_thresh && tctx->slice_ns_ewma > 0) {
+			votes[DESCENT_CLASS_HOG]    = 80;
+			votes[DESCENT_CLASS_NORMAL] = 20;
+			return;
+		}
+
+		/* Background: low wakeup freq + long slices */
+		if (tctx->wakeup_freq < WAKEUP_FREQ_BATCH_THRESH &&
+		    tctx->slice_ns_ewma > SLICE_NS_BATCH_THRESH) {
+			votes[DESCENT_CLASS_BACKGROUND] = 80;
+			votes[DESCENT_CLASS_NORMAL]	= 20;
+			return;
+		}
+
+		/* Normal: high wakeup freq + short slices */
 		if (tctx->wakeup_freq > WAKEUP_FREQ_INTERACTIVE_THRESH &&
 		    tctx->slice_ns_ewma < SLICE_NS_INTERACTIVE_THRESH) {
-			votes[DESCENT_CLASS_INTERACTIVE] = 80;
-			votes[DESCENT_CLASS_BATCH]	 = 20;
+			votes[DESCENT_CLASS_NORMAL] = 100;
+			return;
 		}
-		/* Batch: low wakeup freq + long slices */
-		else if (tctx->wakeup_freq < WAKEUP_FREQ_BATCH_THRESH &&
-			 tctx->slice_ns_ewma > SLICE_NS_BATCH_THRESH) {
-			votes[DESCENT_CLASS_BATCH]	 = 80;
-			votes[DESCENT_CLASS_INTERACTIVE] = 20;
-		}
-		/* Mixed - prefer interactive for unknown */
-		else {
-			votes[DESCENT_CLASS_INTERACTIVE] = 60;
-			votes[DESCENT_CLASS_BATCH]	 = 40;
-		}
-	} else {
-		/* Default to interactive for unknown behavior */
-		votes[DESCENT_CLASS_INTERACTIVE] = 100;
 	}
+
+	/* Default to normal for unknown behavior */
+	votes[DESCENT_CLASS_NORMAL] = 100;
 }
 
 /* Momentum alpha for EWMA (0.7 in percentage = 70) */
@@ -889,15 +961,14 @@ static void update_classification_momentum(struct task_struct *p,
  */
 static u64 task_dl(struct task_struct *p, struct task_ctx *tctx, u64 enq_flags)
 {
-	struct cpu_descent_ctx *cdctx;
-	struct class_params    *cp;
-	u64			lag_scale, vsleep_max, vtime_min;
-	u64			vtime = p->scx.dsq_vtime;
-	u64			scaled_vtime;
+	struct class_params *cp;
+	u64		     lag_scale, vsleep_max, vtime_min;
+	u64		     vtime = p->scx.dsq_vtime;
+	u64		     scaled_vtime;
 
-	/* Get per-CPU descent context */
-	cdctx = try_lookup_cpu_descent_ctx();
-	if (!cdctx || tctx->task_class >= DESCENT_CLASS_MAX) {
+	/* Get class parameters using new helper */
+	cp = get_class_params_for_scheduling(tctx->task_class);
+	if (!cp || tctx->task_class >= DESCENT_CLASS_MAX) {
 		/* Fallback to flash behavior */
 		lag_scale  = MAX(tctx->wakeup_freq, 1);
 		vsleep_max = scale_by_weight(p, slice_lag * lag_scale);
@@ -914,8 +985,6 @@ static u64 task_dl(struct task_struct *p, struct task_ctx *tctx, u64 enq_flags)
 
 		return vtime;
 	}
-
-	cp = &cdctx->class_params[tctx->task_class];
 
 	/* Calculate scaled vruntime using class-specific scale */
 	scaled_vtime = vtime * cp->vruntime_scale / 1024;
@@ -953,7 +1022,7 @@ static u64 task_dl(struct task_struct *p, struct task_ctx *tctx, u64 enq_flags)
  * scheduling overhead.
  */
 static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
-			 bool *is_idle)
+			 u8 *is_idle)
 {
 	const struct cpumask *primary = cast_mask(primary_cpumask);
 	s32		      cpu;
@@ -962,9 +1031,13 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 	 * Compatibility with older kernels (< v6.14).
 	 */
 	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
-		if (wake_flags)
-			return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags,
-						      is_idle);
+		if (wake_flags) {
+			_Bool local_is_idle;
+			cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags,
+						     &local_is_idle);
+			*is_idle = local_is_idle ? 1 : 0;
+			return cpu;
+		}
 
 		return prev_cpu;
 	}
@@ -986,7 +1059,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 		if (cpu < 0)
 			return prev_cpu;
 	}
-	*is_idle = true;
+	*is_idle = 1;
 
 	return cpu;
 }
@@ -1001,7 +1074,7 @@ s32 BPF_STRUCT_OPS(descent_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
 	struct task_ctx *tctx;
-	bool		 is_idle = false;
+	u8		 is_idle = 0;
 	s32		 cpu;
 
 	if (is_throttled())
@@ -1064,13 +1137,13 @@ static inline s32 smt_sibling(s32 cpu)
 /*
  * Return true if @cpu is in  a partially-idle SMT core, false otherwise.
  */
-static bool is_smt_contended(s32 cpu)
+static u8 is_smt_contended(s32 cpu)
 {
 	const struct cpumask *idle_mask;
-	bool		      is_contended;
+	u8		      is_contended;
 
 	if (!smt_enabled)
-		return false;
+		return 0;
 
 	/*
 	 * If the sibling SMT CPU is not idle and there are other full-idle
@@ -1088,17 +1161,17 @@ static bool is_smt_contended(s32 cpu)
  * Return true if @p is running on a primary CPU (or can't run on a primary
  * CPU due to affinity constraints), false otherwise.
  */
-static bool is_primary_cpu(const struct task_struct *p, s32 cpu)
+static u8 is_primary_cpu(const struct task_struct *p, s32 cpu)
 {
 	if (!primary_all) {
 		const struct cpumask *primary = cast_mask(primary_cpumask);
 
 		if (primary && bpf_cpumask_intersects(primary, p->cpus_ptr) &&
 		    !bpf_cpumask_test_cpu(cpu, primary))
-			return false;
+			return 0;
 	}
 
-	return true;
+	return 1;
 }
 
 /*
@@ -1106,10 +1179,10 @@ static bool is_primary_cpu(const struct task_struct *p, s32 cpu)
  *
  * Return true if the task is dispatched, false otherwise.
  */
-static bool try_direct_dispatch(struct task_struct *p, s32 prev_cpu,
-				u64 enq_flags, bool is_running)
+static u8 try_direct_dispatch(struct task_struct *p, s32 prev_cpu,
+			      u64 enq_flags, u8 is_running)
 {
-	bool		 is_idle = false;
+	u8		 is_idle = 0;
 	s32		 cpu	 = prev_cpu;
 	struct task_ctx *tctx;
 
@@ -1123,7 +1196,7 @@ static bool try_direct_dispatch(struct task_struct *p, s32 prev_cpu,
 		if (!is_running)
 			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 
-		return true;
+		return 1;
 	}
 
 	/*
@@ -1137,7 +1210,7 @@ static bool try_direct_dispatch(struct task_struct *p, s32 prev_cpu,
 	if (!is_running && __COMPAT_is_enq_cpu_selected(enq_flags) &&
 	    (!is_smt_contended(prev_cpu) || is_pcpu_task(p)) &&
 	    !(enq_flags & SCX_ENQ_REENQ))
-		return false;
+		return 0;
 
 	/*
 	 * Try migrating to an idle CPU.
@@ -1145,10 +1218,10 @@ static bool try_direct_dispatch(struct task_struct *p, s32 prev_cpu,
 	if (!is_pcpu_task(p)) {
 		cpu = pick_idle_cpu(p, prev_cpu, 0, &is_idle);
 		if (!is_idle)
-			return false;
+			return 0;
 	} else {
 		if (!scx_bpf_test_and_clear_cpu_idle(prev_cpu))
-			return false;
+			return 0;
 	}
 
 	tctx = try_lookup_task_ctx(p);
@@ -1162,7 +1235,7 @@ static bool try_direct_dispatch(struct task_struct *p, s32 prev_cpu,
 	if (cpu != prev_cpu || !is_running)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
-	return true;
+	return 1;
 }
 
 /*
@@ -1170,7 +1243,7 @@ static bool try_direct_dispatch(struct task_struct *p, s32 prev_cpu,
  */
 static void rr_enqueue(struct task_struct *p, s32 prev_cpu, u64 enq_flags)
 {
-	bool		 is_idle;
+	u8		 is_idle;
 	s32		 cpu;
 	struct task_ctx *tctx;
 
@@ -1253,39 +1326,39 @@ void BPF_STRUCT_OPS(descent_enqueue, struct task_struct *p, u64 enq_flags)
  * Return true if the task can keep running on its current CPU, false if
  * the task should migrate.
  */
-static bool keep_running(const struct task_struct *p, s32 cpu)
+static u8 keep_running(const struct task_struct *p, s32 cpu)
 {
 	/* Do not keep running if the task doesn't need to run */
 	if (!is_queued(p))
-		return false;
+		return 0;
 
 	/*
 	 * If the task can't migrate elsewhere, keep it running.
 	 */
 	if (p->nr_cpus_allowed == 1)
-		return true;
+		return 1;
 
 	/*
 	 * Do not keep running if the CPU is not in the primary domain and
 	 * the task can use the primary domain.
 	 */
 	if (!is_primary_cpu(p, cpu))
-		return false;
+		return 0;
 
 	/*
 	 * If the task is running on a CPU with a busy SMT sibling, try to
 	 * move it elsewhere.
 	 */
 	if (is_smt_contended(cpu))
-		return false;
+		return 0;
 
-	return true;
+	return 1;
 }
 
 void BPF_STRUCT_OPS(descent_dispatch, s32 cpu, struct task_struct *prev)
 {
-	int  node	  = __COMPAT_scx_bpf_cpu_node(cpu);
-	bool need_running = prev && keep_running(prev, cpu);
+	int node	 = __COMPAT_scx_bpf_cpu_node(cpu);
+	u8  need_running = prev && keep_running(prev, cpu);
 
 	/*
 	 * Let the CPU go idle if the system is throttled.
@@ -1464,6 +1537,9 @@ void BPF_STRUCT_OPS(descent_stopping, struct task_struct *p, bool runnable)
 		 */
 		slice = MAX(now - tctx->last_run_at, 1);
 
+		/* Update runtime_ns for HOG detection */
+		tctx->runtime_ns += slice;
+
 		if (tctx->slice_ns_ewma)
 			tctx->slice_ns_ewma =
 				calc_avg(tctx->slice_ns_ewma, slice);
@@ -1483,6 +1559,7 @@ void BPF_STRUCT_OPS(descent_stopping, struct task_struct *p, bool runnable)
 
 		/*
 		 * NEW: Phase 3 - Populate loss accumulator for gradient descent
+		 * Always accumulate loss (simplified for Thompson Sampling)
 		 */
 		struct cpu_descent_ctx *cdctx = try_lookup_cpu_descent_ctx();
 		if (cdctx) {
@@ -1491,19 +1568,18 @@ void BPF_STRUCT_OPS(descent_stopping, struct task_struct *p, bool runnable)
 				struct class_loss_accumulator *accum =
 					&cdctx->class_loss[class_id];
 
-				if (accum->active) {
-					/* Track CPU time for throughput/fairness calculation */
-					accum->cpu_time_ns += slice;
+				/* Track CPU time for throughput/fairness calculation */
+				accum->cpu_time_ns += slice;
 
-					/* Track actual runtime vs expected (for throughput_loss) */
-					struct class_params *cp =
-						&cdctx->class_params[class_id];
-					if (slice > cp->base_slice_ns) {
-						accum->deadline_misses++;
-					}
-
-					accum->sample_count++;
+				/* Track actual runtime vs expected (for throughput_loss) */
+				struct class_params *cp =
+					get_class_params_for_scheduling(
+						class_id);
+				if (cp && slice > cp->base_slice_ns) {
+					accum->deadline_misses++;
 				}
+
+				accum->sample_count++;
 			}
 		}
 
@@ -1513,6 +1589,12 @@ void BPF_STRUCT_OPS(descent_stopping, struct task_struct *p, bool runnable)
 		 */
 		if ((now - tctx->class_entry_time) > (100ULL * NSEC_PER_MSEC))
 			update_classification_momentum(p, tctx);
+
+		/*
+		 * Also call classify_task for the scx_cake-style classification
+		 * (runs the 64-counter based classification)
+		 */
+		classify_task(p, tctx);
 	}
 
 	/*
@@ -1550,6 +1632,7 @@ void BPF_STRUCT_OPS(descent_runnable, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * NEW: Phase 3 - Track wakeup latency for loss computation
+	 * Use linear milliseconds (capped at 10ms) for numerical stability
 	 */
 	u64 wakeup_latency = now - tctx->last_woke_at;
 
@@ -1557,7 +1640,7 @@ void BPF_STRUCT_OPS(descent_runnable, struct task_struct *p, u64 enq_flags)
 	tctx->class_metrics.wakeup_latency_ewma = calc_avg(
 		tctx->class_metrics.wakeup_latency_ewma, wakeup_latency);
 
-	/* Accumulate for loss if active */
+	/* Accumulate for loss */
 	struct cpu_descent_ctx *cdctx = try_lookup_cpu_descent_ctx();
 	if (cdctx) {
 		u32 class_id = tctx->task_class;
@@ -1565,12 +1648,12 @@ void BPF_STRUCT_OPS(descent_runnable, struct task_struct *p, u64 enq_flags)
 			struct class_loss_accumulator *accum =
 				&cdctx->class_loss[class_id];
 
-			if (accum->active) {
-				/* Square latency to penalize outliers (scale to μs to avoid overflow) */
-				u64 latency_us = wakeup_latency / 1000;
-				u64 latency_sq = latency_us * latency_us;
-				accum->latency_loss_sum += latency_sq;
-			}
+			/* Convert to milliseconds and cap at 10ms to prevent extreme outliers */
+			u64 latency_ms = wakeup_latency / 1000000; // ns → ms
+			if (latency_ms > 10)
+				latency_ms = 10; // Cap at 10ms
+			accum->latency_loss_sum +=
+				latency_ms; // Linear ms, not squared μs
 		}
 	}
 
@@ -1679,9 +1762,18 @@ s32 BPF_STRUCT_OPS(descent_init_task, struct task_struct *p,
 	}
 
 	/* Initialize classification fields */
-	tctx->task_class       = DESCENT_CLASS_INTERACTIVE;
-	tctx->prev_class       = DESCENT_CLASS_INTERACTIVE;
-	tctx->class_entry_time = bpf_ktime_get_ns();
+	tctx->task_class	 = DESCENT_CLASS_NORMAL;
+	tctx->prev_class	 = DESCENT_CLASS_NORMAL;
+	tctx->class_entry_time	 = bpf_ktime_get_ns();
+	tctx->reclassify_counter = 0;
+	tctx->runtime_ns	 = 0;
+
+	/* Cache kthread flag from task flags (PF_KTHREAD is bit 21) */
+	u8 is_kthread = ((u32)(p->flags >> 21) & 1u);
+	tctx->packed  = (is_kthread << BIT_KTHREAD);
+
+	/* Initialize PPID from parent */
+	tctx->ppid = 0;
 
 	/* NEW: Phase 3 - Initialize momentum-based classification */
 	for (int i = 0; i < DESCENT_CLASS_MAX; i++) {
@@ -1908,105 +2000,6 @@ static int throttle_timerfn(void *map, int *key, struct bpf_timer *timer)
 	return 0;
 }
 
-/*
- * Perturbation timer used for gradient estimation.
- * Called every 10ms to advance perturbations through state machine.
- * 
- * Phase 3: Implements proper sequential perturbation with state tracking:
- * - State tracked per-CPU, not per-class
- * - Sequential: parameter 0 → 1 → 2 → 3 → 4 for class 0, then same for class 1, etc.
- * - Adaptive timing: extend window if not enough samples (< 3)
- * - Proper phase cycle: BASELINE → PLUS → MINUS → send event → next
- */
-static int perturb_timerfn(void *map, int *key, struct bpf_timer *timer)
-{
-	s32			cpu   = bpf_get_smp_processor_id();
-	struct cpu_descent_ctx *cdctx = try_lookup_cpu_descent_ctx();
-	u64			now   = bpf_ktime_get_ns();
-
-	if (!cdctx)
-		goto rearm;
-
-	struct perturb_state_machine *ps       = &cdctx->perturb;
-	u32			      class_id = ps->current_class;
-
-	if (class_id >= DESCENT_CLASS_MAX)
-		goto rearm;
-
-	struct class_params	      *cp    = &cdctx->class_params[class_id];
-	struct class_loss_accumulator *accum = &cdctx->class_loss[class_id];
-
-	/* Check if phase should advance (use 10-20ms adaptive window) */
-	u64 elapsed = now - ps->phase_start_ns;
-
-	/* Extend window if not enough samples collected */
-	if (accum->sample_count < 3 && elapsed < 20 * NSEC_PER_MSEC) {
-		/* Wait for more samples */
-		bpf_timer_start(timer, 5 * NSEC_PER_MSEC, 0);
-		return 0;
-	}
-
-	/* Advance state machine */
-	switch (ps->phase) {
-	case PERTURB_BASELINE:
-		/* Start +ε perturbation */
-		cp->original_value  = get_param_value(cp, ps->param_idx);
-		cp->perturb_epsilon = calculate_epsilon(cp, ps->param_idx);
-		apply_perturbation(cp, ps->param_idx, (s64)cp->perturb_epsilon);
-		cdctx->loss_baseline[class_id] =
-			read_accumulated_loss(cdctx, class_id);
-		reset_loss_accumulator(cdctx, class_id);
-		accum->active = true;
-		ps->phase     = PERTURB_PLUS;
-		break;
-
-	case PERTURB_PLUS:
-		/* Switch to -ε (apply -2ε from current to get to θ-ε) */
-		apply_perturbation(cp, ps->param_idx,
-				   -2 * (s64)cp->perturb_epsilon);
-		cp->loss_plus = read_accumulated_loss(cdctx, class_id);
-		reset_loss_accumulator(cdctx, class_id);
-		accum->active = true;
-		ps->phase     = PERTURB_MINUS;
-		break;
-
-	case PERTURB_MINUS:
-		/* Restore and compute gradient */
-		apply_perturbation(cp, ps->param_idx, (s64)cp->perturb_epsilon);
-		cp->loss_minus = read_accumulated_loss(cdctx, class_id);
-		accum->active  = false;
-
-		/* Send event to userspace */
-		send_gradient_ready_event(cpu, class_id, ps->param_idx,
-					  cp->loss_plus, cp->loss_minus,
-					  cp->perturb_epsilon);
-
-		/* Move to next parameter or class */
-		ps->phase = PERTURB_BASELINE;
-		ps->param_idx++;
-		if (ps->param_idx >= 5) {
-			ps->param_idx = 0;
-			ps->current_class++;
-			if (ps->current_class >= DESCENT_CLASS_MAX) {
-				ps->current_class = 0;
-			}
-		}
-		break;
-
-	default:
-		/* Reset to baseline if in unknown state */
-		ps->phase = PERTURB_BASELINE;
-		break;
-	}
-
-	ps->phase_start_ns = now;
-
-rearm:
-	/* Re-arm timer for 10ms */
-	bpf_timer_start(timer, 10 * NSEC_PER_MSEC, 0);
-	return 0;
-}
-
 s32 BPF_STRUCT_OPS_SLEEPABLE(descent_init)
 {
 	struct bpf_timer       *timer;
@@ -2043,6 +2036,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(descent_init)
 						   cpu);
 		if (cdctx)
 			init_class_params(cdctx);
+
+		/* Also initialize syscall-accessible class_params_stor map */
+		init_cpu_class_params(cpu);
 	}
 
 	timer = bpf_map_lookup_elem(&tickless_timer, &key);
@@ -2083,49 +2079,50 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(descent_init)
 		}
 	}
 
-	/*
-	 * Initialize and start perturbation timer for gradient estimation.
-	 */
-	timer = bpf_map_lookup_elem(&perturb_timer, &key);
-	if (timer) {
-		bpf_timer_init(timer, &perturb_timer, CLOCK_MONOTONIC);
-		bpf_timer_set_callback(timer, perturb_timerfn);
-		err = bpf_timer_start(timer, 10 * NSEC_PER_MSEC, 0);
-		if (err)
-			scx_bpf_error("Failed to arm perturbation timer");
-	}
-
 	return 0;
 }
 
 /*
  * Syscall program to update class parameters from userspace.
+ * Uses syscall-accessible class_params_stor map (BPF_MAP_TYPE_ARRAY)
+ * instead of percpu map to avoid kfunc dependency.
  */
 SEC("syscall")
 int update_class_params(struct descent_params_update *input)
 {
+	struct class_params    *cp;
 	struct cpu_descent_ctx *cdctx;
-	u32			key = 0;
+	u32			key;
 
-	/* Get the per-CPU context for the target CPU */
-	cdctx = bpf_map_lookup_percpu_elem(&cpu_descent_ctx_stor, &key,
-					   input->cpu_id);
-	if (!cdctx)
-		return -ENOENT;
-
+	/* Validate inputs */
+	if (input->cpu_id < 0 || (u32)input->cpu_id >= MAX_CPUS)
+		return -EINVAL;
 	if (input->class_id >= DESCENT_CLASS_MAX)
 		return -EINVAL;
 
+	key = params_key(input->cpu_id, input->class_id);
+
+	/* Update class_params_stor using regular bpf_map_lookup_elem (syscall-safe) */
+	cp = bpf_map_lookup_elem(&class_params_stor, &key);
+	if (!cp)
+		return -ENOENT;
+
 	/* Update parameters with bounds checking */
-	struct class_params *cp = &cdctx->class_params[input->class_id];
-	cp->latency_weight	= clamp_param_value(0, input->latency_weight);
-	cp->base_slice_ns	= clamp_param_value(1, input->base_slice_ns);
-	cp->vruntime_scale	= clamp_param_value(2, input->vruntime_scale);
+	cp->latency_weight = clamp_param_value(0, input->latency_weight);
+	cp->base_slice_ns  = clamp_param_value(1, input->base_slice_ns);
+	cp->vruntime_scale = clamp_param_value(2, input->vruntime_scale);
 	cp->preemption_priority =
 		clamp_param_value(3, input->preemption_priority);
-	cp->migration_cost     = clamp_param_value(4, input->migration_cost);
+	cp->migration_cost = clamp_param_value(4, input->migration_cost);
 
-	cdctx->last_param_sync = bpf_ktime_get_ns();
+	/* Also reset loss accumulators for this class in the per-CPU context */
+	cdctx = try_lookup_cpu_descent_ctx();
+	if (cdctx && input->class_id < DESCENT_CLASS_MAX) {
+		cdctx->class_loss[input->class_id].latency_loss_sum = 0;
+		cdctx->class_loss[input->class_id].deadline_misses  = 0;
+		cdctx->class_loss[input->class_id].cpu_time_ns	    = 0;
+		cdctx->class_loss[input->class_id].sample_count	    = 0;
+	}
 
 	return 0;
 }

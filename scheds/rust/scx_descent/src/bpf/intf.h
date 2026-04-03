@@ -45,13 +45,14 @@ struct domain_arg {
 	s32 sibling_cpu_id;
 };
 
-/* Task classes for descent scheduler */
+/* Task classes for descent scheduler - scx_cake compatible */
 enum descent_class {
-	DESCENT_CLASS_INTERACTIVE = 0,
-	DESCENT_CLASS_AUDIO	  = 1,
-	DESCENT_CLASS_BATCH	  = 2,
-	DESCENT_CLASS_KERNEL	  = 3,
-	DESCENT_CLASS_MAX	  = 4,
+	DESCENT_CLASS_LATENCY_CRITICAL =
+		0, // Games, audio, compositors, kthreads
+	DESCENT_CLASS_NORMAL	 = 1, // Default interactive
+	DESCENT_CLASS_HOG	 = 2, // High CPU usage
+	DESCENT_CLASS_BACKGROUND = 3, // Low priority
+	DESCENT_CLASS_MAX	 = 4,
 };
 
 /* Loss metrics passed to userspace */

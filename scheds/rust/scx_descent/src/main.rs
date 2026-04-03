@@ -11,20 +11,22 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod classifier;
-mod debug;
-mod optimizer;
+mod optimizer_thompson;
 mod profiles;
 mod safety;
 mod stats;
 
+use std::collections::HashSet;
 use std::ffi::c_int;
 use std::fmt::Write;
+use std::fs;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -33,13 +35,13 @@ use anyhow::Result;
 use clap::Parser;
 use classifier::TaskClassifier;
 use crossbeam::channel::RecvTimeoutError;
-use debug::GradientDebugger;
+use libbpf_rs::MapCore;
+use libbpf_rs::MapFlags;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
-use libbpf_rs::RingBufferBuilder;
 use log::{debug, info, warn};
-use optimizer::{DescentOptimizer, GradientEvent};
-use profiles::ProfileConfig;
+use optimizer_thompson::ThompsonSampler;
+use profiles::Profile;
 use safety::SafetyMonitor;
 use scx_stats::prelude::*;
 use scx_utils::autopower::{fetch_power_profile, PowerProfile};
@@ -239,8 +241,34 @@ struct Opts {
 }
 
 // Shared counters for metrics
+#[allow(dead_code)] // Reserved for future gradient descent implementation
 static GRADIENT_UPDATES: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)] // Reserved for future oscillation detection
 static OSCILLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Matches `struct class_loss_accumulator` from BPF (descent.bpf.h)
+/// Layout: 4 x u64 + 1 x u32 = 32 bytes (with 4 bytes implicit padding)
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ClassLossAccumulator {
+    pub latency_loss_sum: u64, // Sum of squared wakeup latencies
+    pub deadline_misses: u64,  // Count of scheduling deadline misses
+    pub cpu_time_ns: u64,      // Total CPU time consumed
+    pub target_share_ns: u64,  // Expected fair share
+    pub sample_count: u32,     // Number of samples in this window
+                               // Implicit 4 bytes padding to align to 8-byte boundary
+}
+
+/// Size of class_loss_accumulator in bytes (matches BPF struct size)
+/// BPF struct: 4 x u64 (32 bytes) + 1 x u32 (4 bytes) + 4 bytes padding = 40 bytes
+const CLASS_LOSS_ACCUMULATOR_SIZE: usize = 40;
+
+/// Number of task classes
+const DESCENT_CLASS_MAX: usize = 4;
+
+/// Offset to class_loss array within cpu_descent_ctx
+/// class_params[4] = 4 * (5 * 8 bytes) = 160 bytes
+const CLASS_LOSS_OFFSET: usize = 160;
 
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
@@ -250,11 +278,12 @@ struct Scheduler<'a> {
     power_profile: PowerProfile,
     stats_server: StatsServer<(), Metrics>,
     user_restart: bool,
-    // Phase 2: optimizer and safety components
-    optimizer: DescentOptimizer,
+    // Phase 5: Thompson Sampling components
+    thompson: ThompsonSampler,
     _classifier: TaskClassifier,
     safety: SafetyMonitor,
-    debugger: Option<GradientDebugger>,
+    profile: Profile,
+    nr_cpus: usize,
 }
 
 impl<'a> Scheduler<'a> {
@@ -280,9 +309,11 @@ impl<'a> Scheduler<'a> {
             std::env::args().collect::<Vec<_>>().join(" ")
         );
 
-        // Load profile configuration
-        let _profile_config = ProfileConfig::from_name(&opts.profile);
-        info!("Using profile: {}", opts.profile);
+        // Load profile configuration using inherent method
+        let profile = Profile::from_str(&opts.profile).unwrap_or_else(|| Profile::default());
+        info!("Using profile: {}", profile);
+
+        let nr_cpus = topo.all_cpus.len();
 
         if opts.idle_resume_us >= 0 {
             if !cpu_idle_resume_latency_supported() {
@@ -386,16 +417,12 @@ impl<'a> Scheduler<'a> {
         let struct_ops = Some(scx_ops_attach!(skel, descent_ops)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
-        // Initialize Phase 2 components
-        let optimizer = DescentOptimizer::new();
+        // Initialize Phase 5 components - Thompson Sampling
+        let thompson = ThompsonSampler::new(nr_cpus, &profile);
         let classifier = TaskClassifier::new();
         let safety = SafetyMonitor::new();
-        let debugger = opts
-            .debug_gradients
-            .map(|interval_ms| GradientDebugger::new(interval_ms));
 
-        // Initialize optimizer states for all CPUs and classes with default params
-        let mut scheduler = Self {
+        Ok(Self {
             skel,
             struct_ops,
             opts,
@@ -403,52 +430,12 @@ impl<'a> Scheduler<'a> {
             power_profile,
             stats_server,
             user_restart: false,
-            optimizer,
+            thompson,
             _classifier: classifier,
             safety,
-            debugger,
-        };
-
-        // Initialize optimizer states with default parameters
-        scheduler.init_optimizer_states();
-
-        Ok(scheduler)
-    }
-
-    fn init_optimizer_states(&mut self) {
-        // Default initial parameters for each class
-        let default_params: [[u64; 5]; 4] = [
-            // INTERACTIVE: [latency_weight, base_slice_ns, vruntime_scale, preemption_priority, migration_cost]
-            [1_000_000, 600_000, 768, 500, 30_000],
-            // AUDIO
-            [100_000, 500_000, 512, 100, 10_000],
-            // BATCH
-            [10_000_000, 5_000_000, 1536, 5_000_000, 100_000],
-            // KERNEL
-            [2_000_000, 1_000_000, 1024, 1_000_000, 20_000],
-        ];
-
-        // Load profile configuration for weights
-        let profile_config = ProfileConfig::from_name(&self.opts.profile);
-        let weights = profile_config.profile.loss_weights();
-
-        for cpu in self.topo.all_cpus.keys() {
-            for class in 0..4u32 {
-                let initial_params = default_params[class as usize];
-                self.optimizer.init_state_with_weights(
-                    *cpu as u32,
-                    class,
-                    initial_params,
-                    weights.clone(),
-                );
-            }
-        }
-
-        info!(
-            "Initialized optimizer states for {} CPUs with profile '{}'",
-            self.topo.all_cpus.len(),
-            self.opts.profile
-        );
+            profile,
+            nr_cpus,
+        })
     }
 
     fn enable_primary_cpu(skel: &mut BpfSkel<'_>, cpu: i32) -> Result<(), u32> {
@@ -622,18 +609,199 @@ impl<'a> Scheduler<'a> {
 
     fn get_metrics(&self) -> Metrics {
         let bss_data = self.skel.maps.bss_data.as_ref().unwrap();
+        let (_total_posteriors, total_obs, avg_uncertainty) = self.thompson.get_stats();
         Metrics {
             nr_running: bss_data.nr_running,
             nr_cpus: bss_data.nr_online_cpus,
             nr_kthread_dispatches: bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: bss_data.nr_direct_dispatches,
             nr_shared_dispatches: bss_data.nr_shared_dispatches,
-            nr_tasks_interactive: 0, // TODO: read from BPF
-            nr_tasks_audio: 0,       // TODO: read from BPF
-            nr_tasks_batch: 0,       // TODO: read from BPF
-            nr_tasks_kernel: 0,      // TODO: read from BPF
-            gradient_updates: GRADIENT_UPDATES.load(Ordering::Relaxed),
-            oscillations: OSCILLATIONS.load(Ordering::Relaxed),
+            nr_tasks_latency_critical: 0, // TODO: read from BPF
+            nr_tasks_normal: 0,           // TODO: read from BPF
+            nr_tasks_hog: 0,              // TODO: read from BPF
+            nr_tasks_background: 0,       // TODO: read from BPF
+            thompson_updates: total_obs as u64,
+            thompson_uncertainty: (avg_uncertainty * 1000.0) as u64, // Scale for display
+        }
+    }
+
+    /// Detect audio daemon TGIDs by scanning comm names
+    fn detect_audio_daemons(&self) -> Vec<u32> {
+        let mut audio_tgids = HashSet::new();
+
+        const AUDIO_COMMS: &[&str] = &[
+            "pipewire",
+            "wireplumber",
+            "pipewire-pulse",
+            "pulseaudio",
+            "jackd",
+            "jackdbus",
+        ];
+
+        // Scan /proc for matching comm names
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name();
+                let pid_str = file_name.to_string_lossy();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", pid)) {
+                        let comm = comm.trim();
+                        if AUDIO_COMMS.iter().any(|&ac| comm.contains(ac)) {
+                            // Get TGID from status
+                            if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid))
+                            {
+                                for line in status.lines() {
+                                    if line.starts_with("Tgid:") {
+                                        if let Some(tgid_str) = line.split_whitespace().nth(1) {
+                                            if let Ok(tgid) = tgid_str.parse::<u32>() {
+                                                audio_tgids.insert(tgid);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        audio_tgids.into_iter().collect()
+    }
+
+    /// Detect game process via Steam envvar or Wine exe
+    fn detect_game_process(&self) -> Option<(u32, u32, u8)> {
+        // Scan /proc for game indicators
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name();
+                let pid_str = file_name.to_string_lossy();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    // Check for Steam environment
+                    if let Ok(environ) = fs::read(format!("/proc/{}/environ", pid)) {
+                        let has_steam = environ
+                            .split(|&b| b == 0)
+                            .filter_map(|kv| std::str::from_utf8(kv).ok())
+                            .any(|s| s.starts_with("SteamGameId=") || s.starts_with("STEAM_GAME="));
+
+                        if has_steam {
+                            // Get TGID and PPID from status
+                            if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid))
+                            {
+                                let mut tgid = pid;
+                                let mut ppid = 0u32;
+                                for line in status.lines() {
+                                    if line.starts_with("Tgid:") {
+                                        if let Some(t) = line.split_whitespace().nth(1) {
+                                            tgid = t.parse().unwrap_or(pid);
+                                        }
+                                    }
+                                    if line.starts_with("PPid:") {
+                                        if let Some(p) = line.split_whitespace().nth(1) {
+                                            ppid = p.parse().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                                return Some((tgid, ppid, 100)); // 100 = Steam confidence
+                            }
+                        }
+                    }
+
+                    // Check for Wine exe
+                    if let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) {
+                        let has_exe = cmdline
+                            .split(|&b| b == 0)
+                            .filter_map(|arg| std::str::from_utf8(arg).ok())
+                            .any(|s| s.to_lowercase().ends_with(".exe"));
+
+                        if has_exe {
+                            if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid))
+                            {
+                                let mut tgid = pid;
+                                let mut ppid = 0u32;
+                                for line in status.lines() {
+                                    if line.starts_with("Tgid:") {
+                                        if let Some(t) = line.split_whitespace().nth(1) {
+                                            tgid = t.parse().unwrap_or(pid);
+                                        }
+                                    }
+                                    if line.starts_with("PPid:") {
+                                        if let Some(p) = line.split_whitespace().nth(1) {
+                                            ppid = p.parse().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                                return Some((tgid, ppid, 90)); // 90 = Wine confidence
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Detect system state (GAMING, COMPILATION, IDLE)
+    fn detect_sched_state(&self, game_tgid: u32) -> u32 {
+        // GAMING: game detected
+        if game_tgid != 0 {
+            return 2; // GAMING
+        }
+
+        // COMPILATION: ≥2 compilers with high CPU usage
+        const COMPILE_COMMS: &[&str] = &[
+            "cc1", "rustc", "clang", "clang++", "ld", "ld.lld", "ninja", "cmake", "as", "gcc",
+            "g++",
+        ];
+
+        let mut compile_count = 0;
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name();
+                let pid_str = file_name.to_string_lossy();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", pid)) {
+                        let comm = comm.trim();
+                        if COMPILE_COMMS.iter().any(|&c| comm.contains(c)) {
+                            compile_count += 1;
+                            if compile_count >= 2 {
+                                return 1; // COMPILATION
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        0 // IDLE
+    }
+
+    /// Update BPF BSS variables for game detection
+    fn update_bpf_game_state(&mut self, game_tgid: u32, game_ppid: u32, game_confidence: u8) {
+        if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
+            bss_data.game_tgid = game_tgid;
+            bss_data.game_ppid = game_ppid;
+            bss_data.game_confidence = game_confidence;
+        }
+    }
+
+    /// Update BPF audio TGIDs
+    fn update_bpf_audio_tgids(&mut self, audio_tgids: &[u32]) {
+        if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
+            let nr_audio = audio_tgids.len().min(16);
+            bss_data.nr_audio_tgids = nr_audio as u32;
+            for (i, &tgid) in audio_tgids.iter().take(16).enumerate() {
+                bss_data.audio_tgids[i] = tgid;
+            }
+        }
+    }
+
+    /// Update BPF sched state
+    fn update_bpf_sched_state(&mut self, state: u32) {
+        if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
+            bss_data.sched_state = state;
         }
     }
 
@@ -641,6 +809,91 @@ impl<'a> Scheduler<'a> {
         uei_exited!(&self.skel, uei)
     }
 
+    /// Read accumulated loss from BPF for a CPU/class using safe struct parsing
+    fn read_loss_from_bpf(&self, cpu: i32, class: u32) -> f64 {
+        if class as usize >= DESCENT_CLASS_MAX {
+            return 0.0;
+        }
+
+        // Use libbpf-rs to lookup per-CPU element
+        let key: u32 = 0;
+
+        match self
+            .skel
+            .maps
+            .cpu_descent_ctx_stor
+            .lookup_percpu(&key.to_ne_bytes(), MapFlags::ANY)
+        {
+            Ok(Some(values)) => {
+                // values is Vec<Vec<u8>> where each element is data for a CPU
+                // Get the specific CPU's data
+                let cpu_idx = cpu as usize;
+                if cpu_idx >= values.len() {
+                    return 0.0;
+                }
+                let data = &values[cpu_idx];
+
+                // Calculate offset to this class's class_loss[class_id]
+                let class_offset =
+                    CLASS_LOSS_OFFSET + (class as usize * CLASS_LOSS_ACCUMULATOR_SIZE);
+
+                // Ensure we have enough data
+                if data.len() < class_offset + CLASS_LOSS_ACCUMULATOR_SIZE {
+                    return 0.0;
+                }
+
+                // Parse the ClassLossAccumulator fields using safe byte conversion
+                let accumulator_data =
+                    &data[class_offset..class_offset + CLASS_LOSS_ACCUMULATOR_SIZE];
+
+                // Helper to safely extract u64 from native-endian bytes
+                fn read_u64(bytes: &[u8]) -> u64 {
+                    if bytes.len() >= 8 {
+                        u64::from_ne_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ])
+                    } else {
+                        0
+                    }
+                }
+
+                // Helper to safely extract u32 from native-endian bytes
+                fn read_u32(bytes: &[u8]) -> u32 {
+                    if bytes.len() >= 4 {
+                        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                    } else {
+                        0
+                    }
+                }
+
+                let accum = ClassLossAccumulator {
+                    latency_loss_sum: read_u64(&accumulator_data[0..8]),
+                    deadline_misses: read_u64(&accumulator_data[8..16]),
+                    cpu_time_ns: read_u64(&accumulator_data[16..24]),
+                    target_share_ns: read_u64(&accumulator_data[24..32]),
+                    sample_count: read_u32(&accumulator_data[32..36]), // sample_count is at offset 32-36 (after 4 u64 fields)
+                };
+
+                // Compute composite loss (same formula as BPF)
+                if accum.sample_count == 0 {
+                    return 0.0;
+                }
+
+                let avg_latency_loss = accum.latency_loss_sum / accum.sample_count as u64;
+                let deadline_penalty = accum.deadline_misses * 10; // 10ms per miss
+
+                (avg_latency_loss + deadline_penalty) as f64
+            }
+            Ok(None) => 0.0,
+            Err(e) => {
+                eprintln!("Error reading loss from BPF: {:?}", e);
+                0.0
+            }
+        }
+    }
+
+    /// Update BPF class parameters using syscall program
     fn update_bpf_params(&mut self, cpu: i32, class: u32, params: [u64; 5]) {
         let prog = &mut self.skel.progs.update_class_params;
 
@@ -687,25 +940,45 @@ impl<'a> Scheduler<'a> {
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
 
-        // Create a channel for gradient events to avoid borrow issues
-        let (gradient_tx, gradient_rx) = crossbeam::channel::unbounded::<GradientEvent>();
+        // Phase 5: Thompson Sampling update interval from profile
+        let update_interval = Duration::from_millis(self.profile.response_ms);
+        let mut last_update = Instant::now();
 
-        // Setup ring buffer for gradient events
-        let mut ringbuf_builder = RingBufferBuilder::new();
-        let tx = gradient_tx.clone();
-        ringbuf_builder.add(&self.skel.maps.gradient_events, move |data| {
-            if data.len() == std::mem::size_of::<GradientEvent>() {
-                let event: GradientEvent =
-                    unsafe { std::ptr::read_unaligned(data.as_ptr() as *const GradientEvent) };
-                let _ = tx.send(event);
+        // Detection state
+        let mut detection_counter: u64 = 0;
+        let mut current_game: Option<(u32, u32, u8)>;
+        let mut current_audio_tgids: Vec<u32>;
+        let mut current_state: u32 = 0;
+
+        // Perform initial detection
+        current_audio_tgids = self.detect_audio_daemons();
+        info!(
+            "Detected {} audio daemon(s): {:?}",
+            current_audio_tgids.len(),
+            current_audio_tgids
+        );
+        self.update_bpf_audio_tgids(&current_audio_tgids);
+
+        // Initial parameter sync: write initial Thompson samples to BPF
+        // Store last_params for each (cpu, class) so the first loss reading
+        // can be properly attributed
+        let nr_cpus = self.nr_cpus;
+        let mut initial_params: Vec<Vec<[u64; 5]>> = Vec::with_capacity(nr_cpus);
+        for cpu in 0..nr_cpus {
+            let mut cpu_params = Vec::with_capacity(4);
+            for class in 0..4u32 {
+                let params = self.thompson.sample_params(cpu as u32, class);
+                cpu_params.push(params);
             }
-            0
-        })?;
-
-        let ringbuf = ringbuf_builder.build()?;
-
-        // NEW: Phase 3 - Counter for checkpoint creation
-        let mut update_counter: u64 = 0;
+            initial_params.push(cpu_params);
+        }
+        // Now write the params to BPF
+        for cpu in 0..nr_cpus {
+            for class in 0..4u32 {
+                self.update_bpf_params(cpu as i32, class, initial_params[cpu][class as usize]);
+            }
+        }
+        info!("Initial parameters synced to BPF");
 
         // Main loop
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
@@ -714,71 +987,106 @@ impl<'a> Scheduler<'a> {
                 break;
             }
 
-            // Poll ring buffer with timeout
-            match ringbuf.poll(Duration::from_millis(10)) {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("Ring buffer poll error: {}", e);
+            // Periodic detection (every ~5 seconds)
+            detection_counter += 1;
+            if detection_counter % 500 == 0 {
+                // Re-detect audio daemons periodically
+                current_audio_tgids = self.detect_audio_daemons();
+                self.update_bpf_audio_tgids(&current_audio_tgids);
+
+                // Detect game process
+                current_game = self.detect_game_process();
+                let game_tgid = current_game.map(|(tgid, _, _)| tgid).unwrap_or(0);
+                let game_ppid = current_game.map(|(_, ppid, _)| ppid).unwrap_or(0);
+                let game_confidence = current_game.map(|(_, _, conf)| conf).unwrap_or(0);
+
+                // Detect system state
+                let new_state = self.detect_sched_state(game_tgid);
+
+                // Update BPF state if changed
+                if new_state != current_state || game_tgid != 0 {
+                    current_state = new_state;
+                    self.update_bpf_game_state(game_tgid, game_ppid, game_confidence);
+                    self.update_bpf_sched_state(current_state);
+
+                    /*
+                    let state_str = match current_state {
+                        2 => "GAMING",
+                        1 => "COMPILATION",
+                        _ => "IDLE",
+                    };
+
+                    if game_tgid != 0 {
+                        info!(
+                            "State: {} (game TGID={}, PPID={}, confidence={})",
+                            state_str, game_tgid, game_ppid, game_confidence
+                        );
+                    } else {
+                        debug!("State: {} (no game detected)", state_str);
+                    }*/
                 }
             }
 
-            // Process any gradient events
-            while let Ok(event) = gradient_rx.try_recv() {
-                debug!(
-                    "Received gradient event: CPU {} class {} param {} loss_p {} loss_m {}",
-                    event.cpu_id,
-                    event.class_id,
-                    event.param_idx,
-                    event.loss_plus,
-                    event.loss_minus
-                );
-
-                if let Some(new_params) = self.optimizer.process_gradient_event(&event) {
-                    self.update_bpf_params(event.cpu_id, event.class_id, new_params);
-                    GRADIENT_UPDATES.fetch_add(1, Ordering::Relaxed);
-                    update_counter += 1;
-                }
-            }
-
-            // NEW: Phase 3 - Checkpoint every 10 updates per CPU/class
-            if update_counter > 0 && update_counter % 10 == 0 {
-                let cpus: Vec<_> = self.topo.all_cpus.keys().cloned().collect();
-                for cpu in &cpus {
+            // Phase 5: Thompson Sampling update cycle
+            if last_update.elapsed() >= update_interval {
+                // Thompson Sampling update cycle for all CPUs and classes
+                for cpu in 0..self.nr_cpus {
                     for class in 0..4u32 {
-                        self.optimizer.create_checkpoint(*cpu as u32, class);
-                    }
-                }
-                debug!("Created checkpoints at update {}", update_counter);
-            }
+                        // Step 1: Read accumulated loss from BPF (from PREVIOUS parameter window)
+                        // This must happen BEFORE writing new params, as update_bpf_params
+                        // resets the accumulators!
+                        let loss = self.read_loss_from_bpf(cpu as i32, class);
 
-            // NEW: Phase 3 - Check for degradation and rollback if needed
-            /*
-            let cpus: Vec<_> = self.topo.all_cpus.keys().cloned().collect();
-            for cpu in &cpus {
-                for class in 0..4u32 {
-                    if let Some(state) = self.optimizer.get_state(*cpu as u32, class) {
-                        if let Some(checkpoint_loss) =
-                            self.optimizer.get_checkpoint_loss(*cpu as u32, class)
+                        // Step 2: Get the params that produced this loss (from previous iteration)
+                        // These were stored by sample_params() in the previous update cycle
+                        let params = self
+                            .thompson
+                            .get_last_params(cpu as u32, class)
+                            .unwrap_or_else(|| {
+                                // Fallback: if no stored params, use current sample
+                                // This happens only on the first iteration
+                                self.thompson.sample_params(cpu as u32, class)
+                            });
+
+                        // Step 3: SAFETY CHECK - Detect catastrophic loss spikes
+                        if let Some(checkpoint_params) = self
+                            .safety
+                            .check_and_protect(cpu as u32, class, loss, &params)
                         {
-                            if let Some(&current_loss) = state.loss_history.back() {
-                                // Rollback if loss increased > 20%
-                                if current_loss > checkpoint_loss * 1.2 && checkpoint_loss > 0.0 {
-                                    warn!(
-                                        "Degradation detected on CPU {} class {}: current_loss={:.2} > 1.2 * checkpoint_loss={:.2}, rolling back",
-                                        cpu, class, current_loss, checkpoint_loss
-                                    );
-                                    OSCILLATIONS.fetch_add(1, Ordering::Relaxed);
-                                    if let Some(new_params) =
-                                        self.optimizer.rollback(*cpu as u32, class)
-                                    {
-                                        self.update_bpf_params(*cpu as i32, class, new_params);
-                                    }
-                                }
-                            }
+                            // Loss spike detected - restore checkpoint
+                            /*
+                            eprintln!("Safety: Loss spike on CPU {} class {} - restoring checkpoint (loss={:.0})", 
+                                      cpu, class, loss);
+                            */
+                            self.update_bpf_params(cpu as i32, class, checkpoint_params);
+                            // Reset Thompson posterior for this (cpu, class) to encourage re-exploration
+                            self.thompson.reset_posteriors_for_cpu_class(
+                                cpu as u32,
+                                class,
+                                &self.profile.default_params,
+                                &self.profile.bounds,
+                            );
+                            continue;
                         }
+
+                        // Step 4: Normal Thompson update with the loss from previous params
+                        self.thompson.update(cpu as u32, class, params, loss);
+
+                        // Step 5: Sample NEW parameters for the NEXT window
+                        let new_params = self.thompson.sample_params(cpu as u32, class);
+
+                        // Step 6: Write new params to BPF (this resets accumulators for next iteration)
+                        self.update_bpf_params(cpu as i32, class, new_params);
                     }
                 }
-            }*/
+
+                // Optional: Debug output
+                if self.opts.debug_gradients.is_some() {
+                    self.output_thompson_debug();
+                }
+
+                last_update = Instant::now();
+            }
 
             // Handle stats
             match req_ch.recv_timeout(Duration::from_millis(10)) {
@@ -786,15 +1094,91 @@ impl<'a> Scheduler<'a> {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(e) => Err(e)?,
             }
-
-            // Optional gradient debugging output
-            if let Some(ref mut debugger) = self.debugger {
-                debugger.maybe_output(&self.optimizer);
-            }
         }
 
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
+    }
+
+    /// Output Thompson sampler debug info
+    fn output_thompson_debug(&self) {
+        use optimizer_thompson::PosteriorStats;
+
+        let interval_ms = self.opts.debug_gradients.unwrap_or(1000);
+        static mut LAST_OUTPUT: u64 = 0;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        unsafe {
+            if now - LAST_OUTPUT < interval_ms {
+                return;
+            }
+            LAST_OUTPUT = now;
+        }
+
+        eprintln!("\n=== Thompson Sampling State at {:?} ===", Instant::now());
+
+        // Show stats for each CPU and class
+        for cpu in 0..self.nr_cpus {
+            let mut cpu_has_data = false;
+
+            for class in 0..4u32 {
+                if let Some(stats) = self.thompson.get_detailed_stats(cpu as u32, class) {
+                    if !cpu_has_data {
+                        eprintln!("\nCPU {}:", cpu);
+                        cpu_has_data = true;
+                    }
+
+                    let class_name = match class {
+                        0 => "LATENCY_CRITICAL",
+                        1 => "NORMAL",
+                        2 => "HOG",
+                        3 => "BACKGROUND",
+                        _ => "UNKNOWN",
+                    };
+
+                    eprintln!(
+                        "  Class {} ({}): samples={} baseline_loss={:.2}",
+                        class, class_name, stats.total_samples, stats.baseline_loss
+                    );
+
+                    // Show per-parameter posterior info
+                    for param_idx in 0..5 {
+                        let PosteriorStats {
+                            mean,
+                            std,
+                            n_observations,
+                        } = stats.posteriors[param_idx];
+                        // Only show if we have actual observations (n_observations > 0)
+                        if n_observations > 0.0 {
+                            eprintln!(
+                                "    Param {}: mean={:.0} std={:.0} n={:.0}",
+                                param_idx, mean, std, n_observations
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Global stats
+        let (total, obs, unc) = self.thompson.get_stats();
+        eprintln!(
+            "\nGlobal: {} posteriors, {:.0} observations, avg_uncertainty={:.2}",
+            total, obs, unc
+        );
+
+        // Safety stats
+        let safety_stats = self.safety.get_stats();
+        eprintln!(
+            "Safety: {} checkpoints, {} loss_history, {} restorations",
+            safety_stats.checkpoints_stored,
+            safety_stats.loss_history_size,
+            safety_stats.restorations
+        );
     }
 }
 
