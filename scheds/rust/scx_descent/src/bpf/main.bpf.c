@@ -411,6 +411,13 @@ static void init_class_params(struct cpu_descent_ctx *cdctx)
 		cdctx->class_latency[i].max_latency_ns	 = 0;
 		cdctx->class_latency[i].sample_count	 = 0;
 	}
+
+	/* NEW: Initialize load accumulators for all classes */
+	for (int i = 0; i < DESCENT_CLASS_MAX; i++) {
+		cdctx->class_load[i].cycles_spent   = 0;
+		cdctx->class_load[i].sample_count   = 0;
+		cdctx->class_load[i].last_update_ns = bpf_ktime_get_ns();
+	}
 }
 
 /*
@@ -424,6 +431,18 @@ static void reset_latency_accumulator(struct cpu_descent_ctx *cdctx,
 		cdctx->class_latency[class_id].total_latency_ns = 0;
 		cdctx->class_latency[class_id].max_latency_ns	= 0;
 		cdctx->class_latency[class_id].sample_count	= 0;
+	}
+}
+
+/*
+ * Reset load accumulators for a class after userspace has read them.
+ */
+static void reset_load_accumulator(struct cpu_descent_ctx *cdctx, u32 class_id)
+{
+	if (class_id < DESCENT_CLASS_MAX) {
+		cdctx->class_load[class_id].cycles_spent   = 0;
+		cdctx->class_load[class_id].sample_count   = 0;
+		cdctx->class_load[class_id].last_update_ns = bpf_ktime_get_ns();
 	}
 }
 
@@ -531,6 +550,11 @@ struct task_ctx {
 	 * NEW: Latency tracking for PIE controller
 	 */
 	u64 enqueue_time_ns; /* Timestamp when task was enqueued */
+
+	/*
+	 * NEW: For load tracking - track when task started running
+	 */
+	u64 last_run_start_ns; /* Timestamp when task entered running state */
 
 	/*
 	 * Classification metrics.
@@ -1553,7 +1577,12 @@ void BPF_STRUCT_OPS(descent_running, struct task_struct *p)
 		tctx->enqueue_time_ns = 0;
 	}
 
-	tctx->last_run_at = bpf_ktime_get_ns();
+	/*
+	 * NEW: Record start time for load tracking
+	 */
+	tctx->last_run_start_ns = bpf_ktime_get_ns();
+
+	tctx->last_run_at	= bpf_ktime_get_ns();
 
 	/*
 	 * Adjust target CPU frequency before the task starts to run.
@@ -1623,6 +1652,38 @@ void BPF_STRUCT_OPS(descent_stopping, struct task_struct *p, bool runnable)
 		 * (runs the 64-counter based classification)
 		 */
 		classify_task(p, tctx);
+
+		/*
+		 * NEW: Load tracking - accumulate cycles spent running
+		 */
+		if (tctx->last_run_start_ns > 0) {
+			u64 slice_ns = now - tctx->last_run_start_ns;
+
+			/* Accumulate to per-class load metrics */
+			struct cpu_descent_ctx *cdctx =
+				try_lookup_cpu_descent_ctx();
+			if (cdctx && tctx->task_class < DESCENT_CLASS_MAX) {
+				struct class_load_accumulator *load =
+					&cdctx->class_load[tctx->task_class];
+
+				/* Per-CPU data doesn't need atomics - direct accumulation */
+				load->cycles_spent += slice_ns;
+				load->sample_count += 1;
+
+				/* DEBUG: Trace load accumulation */
+				bpf_printk(
+					"LOAD: class=%u slice=%lu cycles=%lu samples=%lu",
+					tctx->task_class, slice_ns,
+					load->cycles_spent, load->sample_count);
+			} else {
+				/* DEBUG: Trace why accumulation failed */
+				bpf_printk("LOAD SKIP: cdctx=%p class=%u",
+					   cdctx, tctx->task_class);
+			}
+
+			/* Reset for next run */
+			tctx->last_run_start_ns = 0;
+		}
 	}
 
 	/*
@@ -2129,6 +2190,46 @@ int update_class_params(struct descent_params_update *input)
 	cdctx = try_lookup_cpu_descent_ctx();
 	if (cdctx && input->class_id < DESCENT_CLASS_MAX) {
 		reset_latency_accumulator(cdctx, input->class_id);
+	}
+
+	return 0;
+}
+
+/*
+ * Syscall program to reset load accumulators after userspace has read them.
+ * This is called after update_autorate_and_pie() processes load metrics.
+ */
+SEC("syscall")
+int reset_load_accumulators(struct reset_load_args *args)
+{
+	struct cpu_descent_ctx *cdctx;
+	u32			key = 0;
+	int			cpu;
+
+	/* Validate class_id */
+	if (args->class_id >= DESCENT_CLASS_MAX)
+		return -EINVAL;
+
+	/* Reset for specific CPU or all CPUs */
+	if (args->cpu_id >= 0) {
+		/* Single CPU mode */
+		if ((u32)args->cpu_id >= MAX_CPUS)
+			return -EINVAL;
+
+		cdctx = bpf_map_lookup_percpu_elem(&cpu_descent_ctx_stor, &key,
+						   args->cpu_id);
+		if (!cdctx)
+			return -ENOENT;
+
+		reset_load_accumulator(cdctx, args->class_id);
+	} else {
+		/* All CPUs mode (-1) */
+		for (cpu = 0; cpu < MAX_CPUS; cpu++) {
+			cdctx = bpf_map_lookup_percpu_elem(
+				&cpu_descent_ctx_stor, &key, cpu);
+			if (cdctx)
+				reset_load_accumulator(cdctx, args->class_id);
+		}
 	}
 
 	return 0;

@@ -18,6 +18,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::autorate::AutorateConfig;
+
 /// Class indices matching bpf/intf.h
 #[allow(dead_code)] // Part of public API for future task classification
 pub const DESCENT_CLASS_LATENCY_CRITICAL: usize = 0; // Games, audio, compositors, kthreads
@@ -62,6 +64,8 @@ pub struct Profile {
     /// Target latencies per class (ns)
     /// [LATENCY_CRITICAL, NORMAL, HOG, BACKGROUND]
     pub target_latencies_ns: [u64; 4],
+    /// NEW: CAKE Autorate configuration
+    pub autorate: AutorateConfig,
 }
 
 impl Profile {
@@ -125,6 +129,53 @@ impl Profile {
                 10_000_000, // HOG: 10 ms
                 50_000_000, // BACKGROUND: 50 ms
             ],
+            autorate: AutorateConfig {
+                enabled: false, // Default: disabled (opt-in via --autorate)
+
+                // Per-class min/baseline/max parameters
+                // Gaming: aggressive max for LATENCY_CRITICAL, wide ranges
+                min_params: [
+                    // LATENCY_CRITICAL: conservative minimums
+                    [50_000, 300_000, 384, 50, 5_000],
+                    // NORMAL
+                    [100_000, 500_000, 512, 50, 10_000],
+                    // HOG
+                    [500_000, 2_000_000, 1024, 50, 30_000],
+                    // BACKGROUND
+                    [100_000, 500_000, 512, 50, 10_000],
+                ],
+                baseline_params: [
+                    // LATENCY_CRITICAL: standard gaming baseline
+                    [100_000, 600_000, 512, 50, 10_000],
+                    // NORMAL
+                    [1_000_000, 2_000_000, 768, 100, 30_000],
+                    // HOG
+                    [5_000_000, 10_000_000, 1536, 100, 100_000],
+                    // BACKGROUND
+                    [1_000_000, 2_000_000, 1024, 100, 20_000],
+                ],
+                max_params: [
+                    // LATENCY_CRITICAL: very aggressive for low latency
+                    // Within bounds: (10K,10M), (100K,10M), (256,2048), (10,200), (1K,10M)
+                    [2_000_000, 5_000_000, 1536, 150, 500_000],
+                    // NORMAL - within bounds
+                    [5_000_000, 8_000_000, 1536, 150, 800_000],
+                    // HOG - within bounds
+                    [8_000_000, 9_000_000, 1920, 150, 900_000],
+                    // BACKGROUND - within bounds
+                    [5_000_000, 8_000_000, 1536, 150, 800_000],
+                ],
+
+                // Aggressive gaming tuning
+                high_load_threshold: 0.75,
+                low_load_threshold: 0.25,
+                ramp_up_rate: 1.08,            // 8% increase (aggressive)
+                ramp_down_rate: 0.75,          // 25% decrease
+                decay_rate: 0.98,              // 2% decay toward baseline
+                adjust_up_refractory_ms: 50,   // 50ms between upward adjustments
+                adjust_down_refractory_ms: 20, // 20ms between downward
+                bufferbloat_threshold: 1.5,    // 1.5x target = bufferbloat
+            },
         }
     }
 
@@ -188,6 +239,42 @@ impl Profile {
                 20_000_000,  // HOG: 20 ms
                 100_000_000, // BACKGROUND: 100 ms
             ],
+            autorate: AutorateConfig {
+                enabled: false,
+
+                min_params: [
+                    // More conservative than gaming
+                    [100_000, 400_000, 512, 75, 15_000],
+                    [200_000, 800_000, 640, 75, 20_000],
+                    [750_000, 4_000_000, 1280, 75, 50_000],
+                    [200_000, 800_000, 640, 75, 20_000],
+                ],
+                baseline_params: [
+                    // Standard production baselines
+                    [100_000, 600_000, 512, 100, 30_000],
+                    [500_000, 1_000_000, 768, 100, 30_000],
+                    [2_000_000, 5_000_000, 1536, 100, 50_000],
+                    [1_000_000, 2_000_000, 1024, 100, 20_000],
+                ],
+                max_params: [
+                    // Moderately aggressive - all within bounds
+                    // Bounds: (100K,5M), (200K,5M), (512,1536), (50,150), (5K,1M)
+                    [1_000_000, 4_000_000, 1280, 125, 500_000],
+                    [3_000_000, 4_500_000, 1408, 135, 750_000],
+                    [4_000_000, 4_800_000, 1472, 140, 900_000],
+                    [3_000_000, 4_500_000, 1408, 135, 650_000],
+                ],
+
+                // Balanced tuning
+                high_load_threshold: 0.75,
+                low_load_threshold: 0.30,
+                ramp_up_rate: 1.04,   // 4% increase (moderate)
+                ramp_down_rate: 0.80, // 20% decrease
+                decay_rate: 0.99,     // 1% decay
+                adjust_up_refractory_ms: 75,
+                adjust_down_refractory_ms: 25,
+                bufferbloat_threshold: 1.5,
+            },
         }
     }
 
@@ -251,6 +338,39 @@ impl Profile {
                 50_000_000,  // HOG: 50 ms
                 200_000_000, // BACKGROUND: 200 ms
             ],
+            autorate: AutorateConfig {
+                enabled: false,
+
+                // Narrow ranges for stability
+                min_params: [
+                    [750_000, 1_500_000, 1280, 100, 75_000],
+                    [750_000, 4_000_000, 1280, 100, 75_000],
+                    [750_000, 6_000_000, 1280, 100, 75_000],
+                    [750_000, 4_000_000, 1280, 100, 75_000],
+                ],
+                baseline_params: [
+                    [1_000_000, 2_000_000, 1536, 100, 100_000],
+                    [1_000_000, 5_000_000, 1536, 100, 100_000],
+                    [1_000_000, 8_000_000, 1536, 100, 100_000],
+                    [1_000_000, 5_000_000, 1536, 100, 100_000],
+                ],
+                max_params: [
+                    [2_000_000, 5_000_000, 2048, 100, 200_000],
+                    [2_000_000, 8_000_000, 2048, 100, 200_000],
+                    [2_000_000, 10_000_000, 2048, 100, 200_000],
+                    [2_000_000, 8_000_000, 2048, 100, 200_000],
+                ],
+
+                // Conservative tuning for stability
+                high_load_threshold: 0.80, // Higher threshold
+                low_load_threshold: 0.30,
+                ramp_up_rate: 1.02,           // 2% increase (very conservative)
+                ramp_down_rate: 0.90,         // 10% decrease (gentle)
+                decay_rate: 0.995,            // 0.5% decay (very slow)
+                adjust_up_refractory_ms: 200, // Long refractory
+                adjust_down_refractory_ms: 100,
+                bufferbloat_threshold: 1.8, // Tolerate higher latency
+            },
         }
     }
 }
@@ -323,6 +443,11 @@ impl Profile {
     #[allow(dead_code)] // Part of public API for PIE controller initialization
     pub fn get_pie_config(&self) -> (u64, u64, i64) {
         (self.pie_alpha, self.pie_beta, self.pie_max_integral)
+    }
+
+    /// Check if CAKE Autorate is enabled for this profile
+    pub fn is_autorate_enabled(&self) -> bool {
+        self.autorate.enabled
     }
 }
 
@@ -501,5 +626,75 @@ mod tests {
         assert!(s.contains("10ms"));
         assert!(s.contains("α=4"));
         assert!(s.contains("β=2"));
+    }
+
+    #[test]
+    fn test_gaming_autorate_config() {
+        let p = Profile::gaming();
+        assert!(!p.autorate.enabled); // Disabled by default
+        assert!((p.autorate.ramp_up_rate - 1.08).abs() < f64::EPSILON); // 8% aggressive
+        assert!((p.autorate.ramp_down_rate - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_production_autorate_config() {
+        let p = Profile::production();
+        assert!(!p.autorate.enabled);
+        assert!((p.autorate.ramp_up_rate - 1.04).abs() < f64::EPSILON); // 4% moderate
+    }
+
+    #[test]
+    fn test_server_autorate_config() {
+        let p = Profile::server();
+        assert!(!p.autorate.enabled);
+        assert!((p.autorate.ramp_up_rate - 1.02).abs() < f64::EPSILON); // 2% conservative
+    }
+
+    #[test]
+    fn test_autorate_params_in_bounds() {
+        // Verify all autorate params fall within profile bounds
+        for profile_fn in [Profile::gaming, Profile::production, Profile::server] {
+            let p = profile_fn();
+            for class in 0..DESCENT_CLASS_MAX {
+                for param in 0..PARAM_COUNT {
+                    let (min_bound, max_bound) = p.bounds[class][param];
+
+                    assert!(
+                        p.autorate.min_params[class][param] >= min_bound,
+                        "min_params out of bounds: profile={}, class={}, param={}",
+                        p.name,
+                        class,
+                        param
+                    );
+                    assert!(
+                        p.autorate.max_params[class][param] <= max_bound,
+                        "max_params out of bounds: profile={}, class={}, param={}",
+                        p.name,
+                        class,
+                        param
+                    );
+                    assert!(
+                        p.autorate.baseline_params[class][param] >= min_bound
+                            && p.autorate.baseline_params[class][param] <= max_bound,
+                        "baseline_params out of bounds: profile={}, class={}, param={}",
+                        p.name,
+                        class,
+                        param
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_autorate_enabled() {
+        let gaming = Profile::gaming();
+        assert!(!gaming.is_autorate_enabled());
+
+        let production = Profile::production();
+        assert!(!production.is_autorate_enabled());
+
+        let server = Profile::server();
+        assert!(!server.is_autorate_enabled());
     }
 }

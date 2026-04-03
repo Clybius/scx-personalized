@@ -83,4 +83,22 @@ struct gradient_ready_event {
 	u64 timestamp;
 };
 
+/* Load metrics for CAKE Autorate - request/response struct */
+struct load_metrics_request {
+	s32 cpu_id; /* -1 for aggregate across all CPUs */
+	u32 class_id; /* Class to query */
+};
+
+struct load_metrics_response {
+	u64 cycles_spent; /* Total cycles consumed */
+	u64 sample_count; /* Number of samples */
+	u64 elapsed_ns; /* Time period for calculation */
+};
+
+/* Arguments for reset_load_accumulators syscall */
+struct reset_load_args {
+	s32 cpu_id; /* -1 for all CPUs, >=0 for specific CPU */
+	u32 class_id; /* Class to reset */
+};
+
 #endif /* __INTF_H */

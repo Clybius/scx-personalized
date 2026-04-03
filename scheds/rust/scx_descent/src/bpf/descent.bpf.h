@@ -94,11 +94,23 @@ struct class_latency_accumulator {
 	u64 sample_count; /* Number of samples */
 };
 
+/*
+ * Per-class load accumulator for CAKE Autorate
+ * Tracks CPU cycles consumed by each task class
+ */
+struct class_load_accumulator {
+	u64 cycles_spent; /* Total CPU cycles spent by this class */
+	u64 sample_count; /* Number of load samples */
+	u64 last_update_ns; /* Last time accumulator was reset */
+};
+
 /* Per-CPU descent context */
 struct cpu_descent_ctx {
 	struct class_params class_params[DESCENT_CLASS_MAX];
 	struct class_latency_accumulator
 		class_latency[DESCENT_CLASS_MAX]; /* CHANGED */
+	struct class_load_accumulator
+		class_load[DESCENT_CLASS_MAX]; /* NEW: Load tracking */
 	u64	last_param_sync;
 };
 
