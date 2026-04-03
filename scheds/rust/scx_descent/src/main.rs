@@ -11,7 +11,7 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod classifier;
-mod optimizer_thompson;
+mod optimizer_pie;
 mod profiles;
 mod safety;
 mod stats;
@@ -40,7 +40,7 @@ use libbpf_rs::MapFlags;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
 use log::{debug, info, warn};
-use optimizer_thompson::ThompsonSampler;
+use optimizer_pie::PieController;
 use profiles::Profile;
 use safety::SafetyMonitor;
 use scx_stats::prelude::*;
@@ -127,10 +127,10 @@ fn cpus_to_cpumask(cpus: &Vec<usize>) -> String {
     name = "scx_descent",
     version,
     disable_version_flag = true,
-    about = "A gradient descent-based scheduler that automatically optimizes scheduling parameters for different workload classes.",
+    about = "A PIE controller-based scheduler that automatically optimizes scheduling parameters for different workload classes.",
     long_about = r#"
-scx_descent is a scheduler that uses gradient descent to automatically optimize
-scheduling parameters for different workload classes (interactive, audio, batch, kernel).
+scx_descent is a scheduler that uses a PIE (Proportional Integral controller Enhanced) to automatically
+optimize scheduling parameters for different workload classes (latency_critical, normal, hog, background).
 
 It operates using an earliest deadline first (EDF) policy with per-class tunable parameters:
 
@@ -140,14 +140,14 @@ It operates using an earliest deadline first (EDF) policy with per-class tunable
 4. preemption_priority (θ₄): Urgency threshold
 5. migration_cost (θ₅): Cross-CPU migration penalty
 
-These parameters are optimized via gradient descent to minimize a composite loss function
-that balances latency, throughput, fairness, and efficiency.
+These parameters are optimized via PIE controller to minimize latency error from target.
 
 Key features:
 - Automatic task classification into workload classes
-- Per-class parameter optimization
+- Per-class parameter optimization via PIE controller
 - Three optimization profiles: gaming, productivity, server
 - Safety mechanisms to prevent parameter oscillation
+- Deterministic control without random exploration
 "#
 )]
 struct Opts {
@@ -199,9 +199,9 @@ struct Opts {
     #[clap(short = 'p', long, default_value = "productivity")]
     profile: String,
 
-    /// Enable gradient debug output every N ms
+    /// Enable PIE controller debug output every N ms
     #[clap(long, value_name = "N")]
-    debug_gradients: Option<u64>,
+    debug_pie: Option<u64>,
 
     /// Update interval for parameter sync (ms)
     #[clap(long, default_value = "50")]
@@ -241,9 +241,9 @@ struct Opts {
 }
 
 // Shared counters for metrics
-#[allow(dead_code)] // Reserved for future gradient descent implementation
+#[allow(dead_code)] // Reserved for future metrics implementation
 static GRADIENT_UPDATES: AtomicU64 = AtomicU64::new(0);
-#[allow(dead_code)] // Reserved for future oscillation detection
+#[allow(dead_code)] // Reserved for future metrics implementation
 static OSCILLATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Matches `struct class_loss_accumulator` from BPF (descent.bpf.h)
@@ -270,6 +270,25 @@ const DESCENT_CLASS_MAX: usize = 4;
 /// class_params[4] = 4 * (5 * 8 bytes) = 160 bytes
 const CLASS_LOSS_OFFSET: usize = 160;
 
+/// Latency metrics structure for PIE controller
+#[derive(Debug, Default)]
+pub struct LatencyMetrics {
+    pub total_latency_ns: u64,
+    pub max_latency_ns: u64,
+    pub sample_count: u64,
+}
+
+/// Helper to safely extract u64 from native-endian bytes
+fn read_u64(bytes: &[u8]) -> u64 {
+    if bytes.len() >= 8 {
+        u64::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    } else {
+        0
+    }
+}
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -278,8 +297,7 @@ struct Scheduler<'a> {
     power_profile: PowerProfile,
     stats_server: StatsServer<(), Metrics>,
     user_restart: bool,
-    // Phase 5: Thompson Sampling components
-    thompson: ThompsonSampler,
+    pie: PieController,
     _classifier: TaskClassifier,
     safety: SafetyMonitor,
     profile: Profile,
@@ -417,8 +435,8 @@ impl<'a> Scheduler<'a> {
         let struct_ops = Some(scx_ops_attach!(skel, descent_ops)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
-        // Initialize Phase 5 components - Thompson Sampling
-        let thompson = ThompsonSampler::new(nr_cpus, &profile);
+        // Initialize Phase 4 components - PIE Controller
+        let pie = PieController::new(nr_cpus, &profile);
         let classifier = TaskClassifier::new();
         let safety = SafetyMonitor::new();
 
@@ -430,7 +448,7 @@ impl<'a> Scheduler<'a> {
             power_profile,
             stats_server,
             user_restart: false,
-            thompson,
+            pie,
             _classifier: classifier,
             safety,
             profile,
@@ -609,19 +627,57 @@ impl<'a> Scheduler<'a> {
 
     fn get_metrics(&self) -> Metrics {
         let bss_data = self.skel.maps.bss_data.as_ref().unwrap();
-        let (_total_posteriors, total_obs, avg_uncertainty) = self.thompson.get_stats();
+
+        // Get PIE stats
+        let pie_stats = self.pie.get_stats();
+
+        // Calculate average latency across all states
+        let mut total_latency = 0u64;
+        let mut latency_count = 0u64;
+        let mut total_integral = 0i64;
+        let mut total_error = 0i64;
+
+        for cpu in 0..self.nr_cpus as u32 {
+            for class in 0..4u32 {
+                if let Some(state) = self.pie.get_state(cpu, class) {
+                    total_latency += state.current_latency_ns;
+                    latency_count += 1;
+                    total_integral += state.integral_accum;
+
+                    let error = state.current_latency_ns as i64 - state.target_latency_ns as i64;
+                    total_error += error;
+                }
+            }
+        }
+
+        let avg_latency = if latency_count > 0 {
+            total_latency / latency_count
+        } else {
+            0
+        };
+        let avg_error = if latency_count > 0 {
+            total_error / latency_count as i64
+        } else {
+            0
+        };
+
         Metrics {
             nr_running: bss_data.nr_running,
             nr_cpus: bss_data.nr_online_cpus,
             nr_kthread_dispatches: bss_data.nr_kthread_dispatches,
             nr_direct_dispatches: bss_data.nr_direct_dispatches,
             nr_shared_dispatches: bss_data.nr_shared_dispatches,
-            nr_tasks_latency_critical: 0, // TODO: read from BPF
-            nr_tasks_normal: 0,           // TODO: read from BPF
-            nr_tasks_hog: 0,              // TODO: read from BPF
-            nr_tasks_background: 0,       // TODO: read from BPF
-            thompson_updates: total_obs as u64,
-            thompson_uncertainty: (avg_uncertainty * 1000.0) as u64, // Scale for display
+
+            // PIE controller metrics
+            nr_tasks_latency_critical: 0, // TODO: read from BPF if available
+            nr_tasks_normal: 0,
+            nr_tasks_hog: 0,
+            nr_tasks_background: 0,
+            pie_updates: pie_stats.total_updates,
+            pie_avg_latency_us: avg_latency / 1000, // Convert ns to µs
+            pie_target_latency_us: 0,               // TODO: get from profile
+            pie_integral: total_integral / 1024,    // De-scale
+            pie_latency_error_us: avg_error / 1000, // Convert to µs
         }
     }
 
@@ -893,6 +949,49 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Read latency metrics from BPF for a CPU/class for PIE controller
+    fn read_latency_metrics(&self, cpu: i32, class: u32) -> LatencyMetrics {
+        if class as usize >= DESCENT_CLASS_MAX {
+            return LatencyMetrics::default();
+        }
+
+        let key: u32 = 0;
+
+        match self
+            .skel
+            .maps
+            .cpu_descent_ctx_stor
+            .lookup_percpu(&key.to_ne_bytes(), MapFlags::ANY)
+        {
+            Ok(Some(values)) => {
+                let cpu_idx = cpu as usize;
+                if cpu_idx >= values.len() {
+                    return LatencyMetrics::default();
+                }
+                let data = &values[cpu_idx];
+
+                // Calculate offset to class_latency[class_id]
+                // class_params[4] = 4 * (5 * 8 bytes) = 160 bytes
+                // class_latency starts after class_params
+                let class_offset = 160 + (class as usize * 24); // 24 bytes per latency_accumulator
+
+                if data.len() < class_offset + 24 {
+                    return LatencyMetrics::default();
+                }
+
+                let accum_data = &data[class_offset..class_offset + 24];
+
+                LatencyMetrics {
+                    total_latency_ns: read_u64(&accum_data[0..8]),
+                    max_latency_ns: read_u64(&accum_data[8..16]),
+                    sample_count: read_u64(&accum_data[16..24]),
+                }
+            }
+            Ok(None) => LatencyMetrics::default(),
+            Err(_) => LatencyMetrics::default(),
+        }
+    }
+
     /// Update BPF class parameters using syscall program
     fn update_bpf_params(&mut self, cpu: i32, class: u32, params: [u64; 5]) {
         let prog = &mut self.skel.progs.update_class_params;
@@ -940,7 +1039,7 @@ impl<'a> Scheduler<'a> {
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
 
-        // Phase 5: Thompson Sampling update interval from profile
+        // Phase 4: PIE Controller update interval from profile
         let update_interval = Duration::from_millis(self.profile.response_ms);
         let mut last_update = Instant::now();
 
@@ -959,23 +1058,12 @@ impl<'a> Scheduler<'a> {
         );
         self.update_bpf_audio_tgids(&current_audio_tgids);
 
-        // Initial parameter sync: write initial Thompson samples to BPF
-        // Store last_params for each (cpu, class) so the first loss reading
-        // can be properly attributed
+        // Initial parameter sync: write default PIE params to BPF
         let nr_cpus = self.nr_cpus;
-        let mut initial_params: Vec<Vec<[u64; 5]>> = Vec::with_capacity(nr_cpus);
-        for cpu in 0..nr_cpus {
-            let mut cpu_params = Vec::with_capacity(4);
-            for class in 0..4u32 {
-                let params = self.thompson.sample_params(cpu as u32, class);
-                cpu_params.push(params);
-            }
-            initial_params.push(cpu_params);
-        }
-        // Now write the params to BPF
         for cpu in 0..nr_cpus {
             for class in 0..4u32 {
-                self.update_bpf_params(cpu as i32, class, initial_params[cpu][class as usize]);
+                let params = self.pie.get_default_params(class);
+                self.update_bpf_params(cpu as i32, class, params);
             }
         }
         info!("Initial parameters synced to BPF");
@@ -1027,62 +1115,30 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
-            // Phase 5: Thompson Sampling update cycle
+            // Phase 4: PIE Controller update cycle
             if last_update.elapsed() >= update_interval {
-                // Thompson Sampling update cycle for all CPUs and classes
+                // PIE update cycle for all CPUs and classes
                 for cpu in 0..self.nr_cpus {
                     for class in 0..4u32 {
-                        // Step 1: Read accumulated loss from BPF (from PREVIOUS parameter window)
-                        // This must happen BEFORE writing new params, as update_bpf_params
-                        // resets the accumulators!
-                        let loss = self.read_loss_from_bpf(cpu as i32, class);
+                        // Step 1: Read latency metrics from BPF
+                        let metrics = self.read_latency_metrics(cpu as i32, class);
 
-                        // Step 2: Get the params that produced this loss (from previous iteration)
-                        // These were stored by sample_params() in the previous update cycle
-                        let params = self
-                            .thompson
-                            .get_last_params(cpu as u32, class)
-                            .unwrap_or_else(|| {
-                                // Fallback: if no stored params, use current sample
-                                // This happens only on the first iteration
-                                self.thompson.sample_params(cpu as u32, class)
-                            });
+                        if metrics.sample_count > 0 {
+                            // Calculate average latency
+                            let avg_latency_ns = metrics.total_latency_ns / metrics.sample_count;
 
-                        // Step 3: SAFETY CHECK - Detect catastrophic loss spikes
-                        if let Some(checkpoint_params) = self
-                            .safety
-                            .check_and_protect(cpu as u32, class, loss, &params)
-                        {
-                            // Loss spike detected - restore checkpoint
-                            /*
-                            eprintln!("Safety: Loss spike on CPU {} class {} - restoring checkpoint (loss={:.0})", 
-                                      cpu, class, loss);
-                            */
-                            self.update_bpf_params(cpu as i32, class, checkpoint_params);
-                            // Reset Thompson posterior for this (cpu, class) to encourage re-exploration
-                            self.thompson.reset_posteriors_for_cpu_class(
-                                cpu as u32,
-                                class,
-                                &self.profile.default_params,
-                                &self.profile.bounds,
-                            );
-                            continue;
+                            // Step 2: Run PIE controller to get new parameters
+                            let new_params = self.pie.update(cpu as u32, class, avg_latency_ns);
+
+                            // Step 3: Write new params to BPF
+                            self.update_bpf_params(cpu as i32, class, new_params);
                         }
-
-                        // Step 4: Normal Thompson update with the loss from previous params
-                        self.thompson.update(cpu as u32, class, params, loss);
-
-                        // Step 5: Sample NEW parameters for the NEXT window
-                        let new_params = self.thompson.sample_params(cpu as u32, class);
-
-                        // Step 6: Write new params to BPF (this resets accumulators for next iteration)
-                        self.update_bpf_params(cpu as i32, class, new_params);
                     }
                 }
 
                 // Optional: Debug output
-                if self.opts.debug_gradients.is_some() {
-                    self.output_thompson_debug();
+                if self.opts.debug_pie.is_some() {
+                    self.output_pie_debug();
                 }
 
                 last_update = Instant::now();
@@ -1100,11 +1156,9 @@ impl<'a> Scheduler<'a> {
         uei_report!(&self.skel, uei)
     }
 
-    /// Output Thompson sampler debug info
-    fn output_thompson_debug(&self) {
-        use optimizer_thompson::PosteriorStats;
-
-        let interval_ms = self.opts.debug_gradients.unwrap_or(1000);
+    /// Output PIE controller debug info
+    fn output_pie_debug(&self) {
+        let interval_ms = self.opts.debug_pie.unwrap_or(1000);
         static mut LAST_OUTPUT: u64 = 0;
 
         let now = std::time::SystemTime::now()
@@ -1119,19 +1173,14 @@ impl<'a> Scheduler<'a> {
             LAST_OUTPUT = now;
         }
 
-        eprintln!("\n=== Thompson Sampling State at {:?} ===", Instant::now());
+        eprintln!("\n=== PIE Controller State at {:?} ===", Instant::now());
 
-        // Show stats for each CPU and class
-        for cpu in 0..self.nr_cpus {
-            let mut cpu_has_data = false;
+        // Show stats for representative CPUs
+        for cpu in 0..self.nr_cpus.min(4) {
+            eprintln!("\nCPU {}:", cpu);
 
             for class in 0..4u32 {
-                if let Some(stats) = self.thompson.get_detailed_stats(cpu as u32, class) {
-                    if !cpu_has_data {
-                        eprintln!("\nCPU {}:", cpu);
-                        cpu_has_data = true;
-                    }
-
+                if let Some(state) = self.pie.get_state(cpu as u32, class) {
                     let class_name = match class {
                         0 => "LATENCY_CRITICAL",
                         1 => "NORMAL",
@@ -1140,44 +1189,35 @@ impl<'a> Scheduler<'a> {
                         _ => "UNKNOWN",
                     };
 
+                    let error_us =
+                        (state.current_latency_ns as i64 - state.target_latency_ns as i64) / 1000;
+
                     eprintln!(
-                        "  Class {} ({}): samples={} baseline_loss={:.2}",
-                        class, class_name, stats.total_samples, stats.baseline_loss
+                        "  Class {} ({}): target={}µs current={}µs error={}µs integral={} updates={}",
+                        class, class_name,
+                        state.target_latency_ns / 1000,
+                        state.current_latency_ns / 1000,
+                        error_us,
+                        state.integral_accum / 1024,
+                        state.update_count
                     );
 
-                    // Show per-parameter posterior info
-                    for param_idx in 0..5 {
-                        let PosteriorStats {
-                            mean,
-                            std,
-                            n_observations,
-                        } = stats.posteriors[param_idx];
-                        // Only show if we have actual observations (n_observations > 0)
-                        if n_observations > 0.0 {
-                            eprintln!(
-                                "    Param {}: mean={:.0} std={:.0} n={:.0}",
-                                param_idx, mean, std, n_observations
-                            );
-                        }
-                    }
+                    eprintln!(
+                        "    Params: lw={} slice={} scale={} preempt={} migrate={}",
+                        state.current_params[0],
+                        state.current_params[1],
+                        state.current_params[2],
+                        state.current_params[3],
+                        state.current_params[4]
+                    );
                 }
             }
         }
 
-        // Global stats
-        let (total, obs, unc) = self.thompson.get_stats();
+        let stats = self.pie.get_stats();
         eprintln!(
-            "\nGlobal: {} posteriors, {:.0} observations, avg_uncertainty={:.2}",
-            total, obs, unc
-        );
-
-        // Safety stats
-        let safety_stats = self.safety.get_stats();
-        eprintln!(
-            "Safety: {} checkpoints, {} loss_history, {} restorations",
-            safety_stats.checkpoints_stored,
-            safety_stats.loss_history_size,
-            safety_stats.restorations
+            "\nGlobal: {} states, {} updates",
+            stats.total_states, stats.total_updates
         );
     }
 }

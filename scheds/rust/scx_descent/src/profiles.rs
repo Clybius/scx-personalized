@@ -1,18 +1,19 @@
 //! Profile System for scx_descent
 //!
 //! Defines three scheduling profiles optimized for different workloads:
-//! - Gaming: Fast response (30ms), wide bounds, high exploration (2.0x)
-//! - Production: Balanced (50ms), standard bounds, moderate exploration (1.5x)
-//! - Server: Conservative (100ms), narrow bounds, low exploration (1.0x)
+//! - Gaming: Fast response (10ms), aggressive PIE tuning (alpha=4, beta=2)
+//! - Production: Balanced (20ms), standard PIE tuning (alpha=8, beta=4)
+//! - Server: Conservative (50ms), gentle PIE tuning (alpha=16, beta=8)
 //!
 //! Each profile specifies:
 //! - Parameter bounds (min/max per class)
 //! - Default parameter values
 //! - Response interval (update frequency)
-//! - Exploration factor (Thompson sampling uncertainty)
+//! - PIE controller parameters (alpha, beta, max_integral)
+//! - Target latencies per task class
 
-// Phase 3: Complete Profile System
-// Gaming, production, server profiles with bounds, response speeds, and exploration factors
+// Phase 2: PIE Controller Integration
+// Gaming, production, server profiles with PIE configuration and target latencies
 
 use std::fmt;
 use std::str::FromStr;
@@ -33,7 +34,7 @@ pub const DESCENT_CLASS_MAX: usize = 4;
 #[allow(dead_code)] // Part of public API for parameter access
 pub const PARAM_COUNT: usize = 5;
 
-/// Parameter bounds for Thompson sampling (min, max) per class per parameter
+/// Parameter bounds (min, max) per class per parameter
 /// [class][param] = (min, max)
 /// Classes: [LATENCY_CRITICAL, NORMAL, HOG, BACKGROUND]
 /// Params:  [latency_weight, base_slice_ns, vruntime_scale, preemption_priority, migration_cost]
@@ -45,15 +46,26 @@ pub type DefaultParams = [[u64; 5]; 4];
 
 pub struct Profile {
     pub name: String,
-    /// Phase 3: Thompson sampler integration
+    /// Phase 2: PIE controller integration
     pub default_params: DefaultParams,
     pub bounds: ParamBounds,
-    pub response_ms: u64,        // 30, 50, or 100
-    pub exploration_factor: f64, // 1.0, 1.5, or 2.0
+    /// Update interval (ms): 10 (gaming), 20 (productivity), 50 (server)
+    pub response_ms: u64,
+    /// PIE alpha (proportional gain divisor, default: 8)
+    /// Gaming: 4 (more aggressive), Prod: 8 (balanced), Server: 16 (conservative)
+    pub pie_alpha: u64,
+    /// PIE beta (integral gain divisor, default: 4)
+    /// Gaming: 2, Prod: 4, Server: 8
+    pub pie_beta: u64,
+    /// Maximum integral accumulator (prevents windup)
+    pub pie_max_integral: i64,
+    /// Target latencies per class (ns)
+    /// [LATENCY_CRITICAL, NORMAL, HOG, BACKGROUND]
+    pub target_latencies_ns: [u64; 4],
 }
 
 impl Profile {
-    /// Gaming profile - Fast response, high exploration, wide bounds
+    /// Gaming profile - Fast response, aggressive PIE, tight latency targets
     pub fn gaming() -> Self {
         Self {
             name: "gaming".to_string(),
@@ -103,12 +115,20 @@ impl Profile {
                     (1_000, 10_000_000),   // migration_cost
                 ],
             ],
-            response_ms: 30,         // Fast response for gaming
-            exploration_factor: 2.0, // High exploration
+            response_ms: 10, // Fast response for gaming
+            pie_alpha: 4,    // Aggressive proportional gain
+            pie_beta: 2,     // Fast integral response
+            pie_max_integral: 1_000_000,
+            target_latencies_ns: [
+                500_000,    // LATENCY_CRITICAL: 500 µs
+                2_000_000,  // NORMAL: 2 ms
+                10_000_000, // HOG: 10 ms
+                50_000_000, // BACKGROUND: 50 ms
+            ],
         }
     }
 
-    /// Production profile (DEFAULT) - Balanced response, moderate exploration, standard bounds
+    /// Production profile (DEFAULT) - Balanced response, moderate PIE, standard targets
     pub fn production() -> Self {
         Self {
             name: "production".to_string(),
@@ -158,12 +178,20 @@ impl Profile {
                     (5_000, 1_000_000),   // migration_cost
                 ],
             ],
-            response_ms: 50,         // Balanced response
-            exploration_factor: 1.5, // Moderate exploration
+            response_ms: 20, // Balanced response
+            pie_alpha: 8,    // Balanced proportional gain
+            pie_beta: 4,     // Balanced integral response
+            pie_max_integral: 1_000_000,
+            target_latencies_ns: [
+                1_000_000,   // LATENCY_CRITICAL: 1 ms
+                5_000_000,   // NORMAL: 5 ms
+                20_000_000,  // HOG: 20 ms
+                100_000_000, // BACKGROUND: 100 ms
+            ],
         }
     }
 
-    /// Server profile - Slower response, conservative exploration, narrow bounds
+    /// Server profile - Slower response, conservative PIE, relaxed targets
     pub fn server() -> Self {
         Self {
             name: "server".to_string(),
@@ -213,8 +241,16 @@ impl Profile {
                     (50_000, 500_000),       // migration_cost
                 ],
             ],
-            response_ms: 100,        // Slower, stable response
-            exploration_factor: 1.0, // Conservative exploration
+            response_ms: 50, // Slower, stable response
+            pie_alpha: 16,   // Conservative proportional gain
+            pie_beta: 8,     // Gentle integral response
+            pie_max_integral: 1_000_000,
+            target_latencies_ns: [
+                2_000_000,   // LATENCY_CRITICAL: 2 ms
+                10_000_000,  // NORMAL: 10 ms
+                50_000_000,  // HOG: 50 ms
+                200_000_000, // BACKGROUND: 200 ms
+            ],
         }
     }
 }
@@ -229,8 +265,8 @@ impl fmt::Display for Profile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} (response: {}ms, exploration: {:.1}x)",
-            self.name, self.response_ms, self.exploration_factor
+            "{} (response: {}ms, PIE: α={}, β={})",
+            self.name, self.response_ms, self.pie_alpha, self.pie_beta
         )
     }
 }
@@ -271,6 +307,23 @@ impl Profile {
         }
         self.default_params[class_id][param_idx]
     }
+
+    /// Get target latency for a specific class
+    /// Returns target latency in nanoseconds
+    #[allow(dead_code)] // Part of public API for PIE controller
+    pub fn get_target_latency(&self, class_id: usize) -> u64 {
+        if class_id >= DESCENT_CLASS_MAX {
+            return self.target_latencies_ns[DESCENT_CLASS_NORMAL];
+        }
+        self.target_latencies_ns[class_id]
+    }
+
+    /// Get PIE controller configuration
+    /// Returns (alpha, beta, max_integral)
+    #[allow(dead_code)] // Part of public API for PIE controller initialization
+    pub fn get_pie_config(&self) -> (u64, u64, i64) {
+        (self.pie_alpha, self.pie_beta, self.pie_max_integral)
+    }
 }
 
 #[cfg(test)]
@@ -281,24 +334,102 @@ mod tests {
     fn test_gaming_profile() {
         let p = Profile::gaming();
         assert_eq!(p.name, "gaming");
-        assert_eq!(p.response_ms, 30);
-        assert_eq!(p.exploration_factor, 2.0);
+        assert_eq!(p.response_ms, 10);
+        assert_eq!(p.pie_alpha, 4);
+        assert_eq!(p.pie_beta, 2);
     }
 
     #[test]
     fn test_production_profile() {
         let p = Profile::production();
         assert_eq!(p.name, "production");
-        assert_eq!(p.response_ms, 50);
-        assert_eq!(p.exploration_factor, 1.5);
+        assert_eq!(p.response_ms, 20);
+        assert_eq!(p.pie_alpha, 8);
+        assert_eq!(p.pie_beta, 4);
     }
 
     #[test]
     fn test_server_profile() {
         let p = Profile::server();
         assert_eq!(p.name, "server");
-        assert_eq!(p.response_ms, 100);
-        assert_eq!(p.exploration_factor, 1.0);
+        assert_eq!(p.response_ms, 50);
+        assert_eq!(p.pie_alpha, 16);
+        assert_eq!(p.pie_beta, 8);
+    }
+
+    #[test]
+    fn test_gaming_target_latencies() {
+        let p = Profile::gaming();
+        assert_eq!(
+            p.target_latencies_ns[DESCENT_CLASS_LATENCY_CRITICAL],
+            500_000
+        );
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_NORMAL], 2_000_000);
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_HOG], 10_000_000);
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_BACKGROUND], 50_000_000);
+    }
+
+    #[test]
+    fn test_production_target_latencies() {
+        let p = Profile::production();
+        assert_eq!(
+            p.target_latencies_ns[DESCENT_CLASS_LATENCY_CRITICAL],
+            1_000_000
+        );
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_NORMAL], 5_000_000);
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_HOG], 20_000_000);
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_BACKGROUND], 100_000_000);
+    }
+
+    #[test]
+    fn test_server_target_latencies() {
+        let p = Profile::server();
+        assert_eq!(
+            p.target_latencies_ns[DESCENT_CLASS_LATENCY_CRITICAL],
+            2_000_000
+        );
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_NORMAL], 10_000_000);
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_HOG], 50_000_000);
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_BACKGROUND], 200_000_000);
+    }
+
+    #[test]
+    fn test_get_target_latency_helper() {
+        let gaming = Profile::gaming();
+        assert_eq!(
+            gaming.get_target_latency(DESCENT_CLASS_LATENCY_CRITICAL),
+            500_000
+        );
+        assert_eq!(gaming.get_target_latency(DESCENT_CLASS_NORMAL), 2_000_000);
+        assert_eq!(gaming.get_target_latency(DESCENT_CLASS_HOG), 10_000_000);
+        assert_eq!(
+            gaming.get_target_latency(DESCENT_CLASS_BACKGROUND),
+            50_000_000
+        );
+
+        // Test out-of-bounds returns NORMAL latency
+        assert_eq!(gaming.get_target_latency(99), 2_000_000);
+    }
+
+    #[test]
+    fn test_get_pie_config_helper() {
+        let gaming = Profile::gaming();
+        let (alpha, beta, max_integral) = gaming.get_pie_config();
+        assert_eq!(alpha, 4);
+        assert_eq!(beta, 2);
+        assert_eq!(max_integral, 1_000_000);
+
+        let production = Profile::production();
+        let (alpha, beta, max_integral) = production.get_pie_config();
+        assert_eq!(alpha, 8);
+        assert_eq!(beta, 4);
+        assert_eq!(max_integral, 1_000_000);
+
+        let server = Profile::server();
+        let (alpha, beta, max_integral) = server.get_pie_config();
+        assert_eq!(alpha, 16);
+        assert_eq!(beta, 8);
+        assert_eq!(max_integral, 1_000_000);
     }
 
     #[test]
@@ -367,7 +498,8 @@ mod tests {
         let p = Profile::gaming();
         let s = format!("{}", p);
         assert!(s.contains("gaming"));
-        assert!(s.contains("30ms"));
-        assert!(s.contains("2.0x"));
+        assert!(s.contains("10ms"));
+        assert!(s.contains("α=4"));
+        assert!(s.contains("β=2"));
     }
 }

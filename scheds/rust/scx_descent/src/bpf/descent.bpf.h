@@ -87,20 +87,19 @@ struct class_params {
 #define PARAM_MIN_MIGRATION_COST 0ULL
 #define PARAM_MAX_MIGRATION_COST (10ULL * NSEC_PER_MSEC)
 
-/* Per-class loss accumulation structure */
-struct class_loss_accumulator {
-	u64 latency_loss_sum; /* Sum of squared wakeup latencies */
-	u64 deadline_misses; /* Count of scheduling deadline misses */
-	u64 cpu_time_ns; /* Total CPU time consumed */
-	u64 target_share_ns; /* Expected fair share */
-	u32 sample_count; /* Number of samples in this window */
+/* Per-class latency accumulation structure for PIE controller */
+struct class_latency_accumulator {
+	u64 total_latency_ns; /* Sum of all enqueue-to-run latencies */
+	u64 max_latency_ns; /* Maximum observed latency */
+	u64 sample_count; /* Number of samples */
 };
 
 /* Per-CPU descent context */
 struct cpu_descent_ctx {
-	struct class_params	      class_params[DESCENT_CLASS_MAX];
-	struct class_loss_accumulator class_loss[DESCENT_CLASS_MAX];
-	u64			      last_param_sync;
+	struct class_params class_params[DESCENT_CLASS_MAX];
+	struct class_latency_accumulator
+		class_latency[DESCENT_CLASS_MAX]; /* CHANGED */
+	u64	last_param_sync;
 };
 
 #endif /* __DESCENT_BPF_H */

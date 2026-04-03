@@ -405,13 +405,25 @@ static void init_class_params(struct cpu_descent_ctx *cdctx)
 
 	cdctx->last_param_sync = bpf_ktime_get_ns();
 
-	/* Initialize loss accumulators for all classes */
+	/* NEW: Initialize latency accumulators for all classes (instead of loss) */
 	for (int i = 0; i < DESCENT_CLASS_MAX; i++) {
-		cdctx->class_loss[i].latency_loss_sum = 0;
-		cdctx->class_loss[i].deadline_misses  = 0;
-		cdctx->class_loss[i].cpu_time_ns      = 0;
-		cdctx->class_loss[i].target_share_ns  = 0;
-		cdctx->class_loss[i].sample_count     = 0;
+		cdctx->class_latency[i].total_latency_ns = 0;
+		cdctx->class_latency[i].max_latency_ns	 = 0;
+		cdctx->class_latency[i].sample_count	 = 0;
+	}
+}
+
+/*
+ * Reset latency accumulators for a class after userspace has read them.
+ * Called from syscall program.
+ */
+static void reset_latency_accumulator(struct cpu_descent_ctx *cdctx,
+				      u32		      class_id)
+{
+	if (class_id < DESCENT_CLASS_MAX) {
+		cdctx->class_latency[class_id].total_latency_ns = 0;
+		cdctx->class_latency[class_id].max_latency_ns	= 0;
+		cdctx->class_latency[class_id].sample_count	= 0;
 	}
 }
 
@@ -514,6 +526,11 @@ struct task_ctx {
 	u32 prev_class; /* Previous class (for hysteresis) */
 	u64 class_entry_time; /* When entered current class */
 	u32 reclassify_counter; /* Counts stops, classification every 64th */
+
+	/*
+	 * NEW: Latency tracking for PIE controller
+	 */
+	u64 enqueue_time_ns; /* Timestamp when task was enqueued */
 
 	/*
 	 * Classification metrics.
@@ -1287,6 +1304,14 @@ void BPF_STRUCT_OPS(descent_enqueue, struct task_struct *p, u64 enq_flags)
 	struct task_ctx *tctx;
 
 	/*
+	 * NEW: Record enqueue time for latency tracking
+	 */
+	tctx = try_lookup_task_ctx(p);
+	if (tctx) {
+		tctx->enqueue_time_ns = bpf_ktime_get_ns();
+	}
+
+	/*
 	 * Keep reusing the same CPU in round-robin mode.
 	 */
 	if (rr_sched) {
@@ -1499,6 +1524,35 @@ void BPF_STRUCT_OPS(descent_running, struct task_struct *p)
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
+
+	/*
+	 * NEW: Calculate and accumulate enqueue-to-run latency
+	 */
+	if (tctx->enqueue_time_ns > 0) {
+		u64 now	       = bpf_ktime_get_ns();
+		u64 latency_ns = now - tctx->enqueue_time_ns;
+
+		/* Accumulate to per-class metrics */
+		struct cpu_descent_ctx *cdctx = try_lookup_cpu_descent_ctx();
+		if (cdctx && tctx->task_class < DESCENT_CLASS_MAX) {
+			struct class_latency_accumulator *accum =
+				&cdctx->class_latency[tctx->task_class];
+
+			/* Update atomically using __sync_fetch_and_add for 64-bit */
+			__sync_fetch_and_add(&accum->total_latency_ns,
+					     latency_ns);
+			__sync_fetch_and_add(&accum->sample_count, 1);
+
+			/* Track max (simple compare-and-set) */
+			if (latency_ns > accum->max_latency_ns) {
+				accum->max_latency_ns = latency_ns;
+			}
+		}
+
+		/* Reset enqueue_time to prevent double counting */
+		tctx->enqueue_time_ns = 0;
+	}
+
 	tctx->last_run_at = bpf_ktime_get_ns();
 
 	/*
@@ -1558,32 +1612,6 @@ void BPF_STRUCT_OPS(descent_stopping, struct task_struct *p, bool runnable)
 			tctx->class_metrics.runtime_per_sched_ewma, slice);
 
 		/*
-		 * NEW: Phase 3 - Populate loss accumulator for gradient descent
-		 * Always accumulate loss (simplified for Thompson Sampling)
-		 */
-		struct cpu_descent_ctx *cdctx = try_lookup_cpu_descent_ctx();
-		if (cdctx) {
-			u32 class_id = tctx->task_class;
-			if (class_id < DESCENT_CLASS_MAX) {
-				struct class_loss_accumulator *accum =
-					&cdctx->class_loss[class_id];
-
-				/* Track CPU time for throughput/fairness calculation */
-				accum->cpu_time_ns += slice;
-
-				/* Track actual runtime vs expected (for throughput_loss) */
-				struct class_params *cp =
-					get_class_params_for_scheduling(
-						class_id);
-				if (cp && slice > cp->base_slice_ns) {
-					accum->deadline_misses++;
-				}
-
-				accum->sample_count++;
-			}
-		}
-
-		/*
 		 * Periodically reclassify task based on observed behavior
 		 * using momentum-based classification with hysteresis
 		 */
@@ -1631,31 +1659,13 @@ void BPF_STRUCT_OPS(descent_runnable, struct task_struct *p, u64 enq_flags)
 	tctx->wakeup_freq = MIN(tctx->wakeup_freq, MAX_WAKEUP_FREQ);
 
 	/*
-	 * NEW: Phase 3 - Track wakeup latency for loss computation
-	 * Use linear milliseconds (capped at 10ms) for numerical stability
+	 * Track wakeup latency EWMA for classification
 	 */
 	u64 wakeup_latency = now - tctx->last_woke_at;
 
 	/* Update EWMA for classification */
 	tctx->class_metrics.wakeup_latency_ewma = calc_avg(
 		tctx->class_metrics.wakeup_latency_ewma, wakeup_latency);
-
-	/* Accumulate for loss */
-	struct cpu_descent_ctx *cdctx = try_lookup_cpu_descent_ctx();
-	if (cdctx) {
-		u32 class_id = tctx->task_class;
-		if (class_id < DESCENT_CLASS_MAX) {
-			struct class_loss_accumulator *accum =
-				&cdctx->class_loss[class_id];
-
-			/* Convert to milliseconds and cap at 10ms to prevent extreme outliers */
-			u64 latency_ms = wakeup_latency / 1000000; // ns → ms
-			if (latency_ms > 10)
-				latency_ms = 10; // Cap at 10ms
-			accum->latency_loss_sum +=
-				latency_ms; // Linear ms, not squared μs
-		}
-	}
 
 	tctx->last_woke_at = now;
 
@@ -2115,13 +2125,10 @@ int update_class_params(struct descent_params_update *input)
 		clamp_param_value(3, input->preemption_priority);
 	cp->migration_cost = clamp_param_value(4, input->migration_cost);
 
-	/* Also reset loss accumulators for this class in the per-CPU context */
+	/* NEW: Reset latency accumulators for this class in the per-CPU context */
 	cdctx = try_lookup_cpu_descent_ctx();
 	if (cdctx && input->class_id < DESCENT_CLASS_MAX) {
-		cdctx->class_loss[input->class_id].latency_loss_sum = 0;
-		cdctx->class_loss[input->class_id].deadline_misses  = 0;
-		cdctx->class_loss[input->class_id].cpu_time_ns	    = 0;
-		cdctx->class_loss[input->class_id].sample_count	    = 0;
+		reset_latency_accumulator(cdctx, input->class_id);
 	}
 
 	return 0;
