@@ -84,39 +84,39 @@ impl Profile {
                 // BACKGROUND
                 [1_000_000, 2_000_000, 1024, 100, 20_000],
             ],
-            // Gaming: moderate bounds for stability while maintaining responsiveness
+            // Gaming: wide bounds matching server profile for stability
             bounds: [
-                // LATENCY_CRITICAL bounds - tighter for stability
+                // LATENCY_CRITICAL bounds - wide for PIE freedom
                 [
-                    (50_000, 2_000_000),  // latency_weight: tighter than before
-                    (200_000, 2_000_000), // base_slice_ns: tighter range
-                    (384, 1024),          // vruntime_scale: narrower range
-                    (50, 100),            // preemption_priority: fixed-ish for stability
-                    (5_000, 500_000),     // migration_cost: tighter range
+                    (500_000, 2_000_000),    // latency_weight
+                    (1_000_000, 10_000_000), // base_slice_ns (wide: 1-10ms)
+                    (1024, 2048),            // vruntime_scale
+                    (100, 100),              // preemption_priority (fixed for stability)
+                    (50_000, 500_000),       // migration_cost
                 ],
                 // NORMAL bounds
                 [
-                    (100_000, 3_000_000), // latency_weight
-                    (300_000, 3_000_000), // base_slice_ns
-                    (512, 1280),          // vruntime_scale
-                    (50, 100),            // preemption_priority
-                    (10_000, 500_000),    // migration_cost
+                    (500_000, 2_000_000),    // latency_weight
+                    (1_000_000, 10_000_000), // base_slice_ns
+                    (1024, 2048),            // vruntime_scale
+                    (100, 100),              // preemption_priority
+                    (50_000, 500_000),       // migration_cost
                 ],
-                // HOG bounds - constrain to prevent CPU hogging
+                // HOG bounds - wide to prevent PIE getting stuck
                 [
-                    (500_000, 8_000_000),   // latency_weight: higher min to deprioritize
-                    (1_000_000, 8_000_000), // base_slice_ns: constrained max
-                    (1024, 1920),           // vruntime_scale: capped to prevent extreme prio
-                    (50, 100),              // preemption_priority
-                    (30_000, 500_000),      // migration_cost
+                    (500_000, 2_000_000),    // latency_weight
+                    (1_000_000, 10_000_000), // base_slice_ns (wide for adaptive tuning)
+                    (1024, 2048),            // vruntime_scale
+                    (100, 100),              // preemption_priority
+                    (50_000, 500_000),       // migration_cost
                 ],
                 // BACKGROUND bounds
                 [
-                    (100_000, 4_000_000), // latency_weight
-                    (500_000, 4_000_000), // base_slice_ns
-                    (768, 1536),          // vruntime_scale
-                    (50, 100),            // preemption_priority
-                    (10_000, 500_000),    // migration_cost
+                    (500_000, 2_000_000),    // latency_weight
+                    (1_000_000, 10_000_000), // base_slice_ns
+                    (1024, 2048),            // vruntime_scale
+                    (100, 100),              // preemption_priority
+                    (50_000, 500_000),       // migration_cost
                 ],
             ],
             response_ms: 20, // Balanced response (was 10ms - too aggressive)
@@ -193,39 +193,39 @@ impl Profile {
                 // BACKGROUND
                 [1_000_000, 2_000_000, 1024, 100, 20_000],
             ],
-            // Production: standard ranges
+            // Production: wide bounds matching server for stability
             bounds: [
                 // LATENCY_CRITICAL bounds
                 [
-                    (100_000, 5_000_000), // latency_weight
-                    (200_000, 5_000_000), // base_slice_ns
-                    (512, 1536),          // vruntime_scale
-                    (50, 150),            // preemption_priority
-                    (5_000, 1_000_000),   // migration_cost
+                    (500_000, 2_000_000),    // latency_weight
+                    (1_000_000, 10_000_000), // base_slice_ns (wide: 1-10ms)
+                    (1024, 2048),            // vruntime_scale
+                    (100, 100),              // preemption_priority (fixed for stability)
+                    (50_000, 500_000),       // migration_cost
                 ],
                 // NORMAL bounds
                 [
-                    (100_000, 5_000_000), // latency_weight
-                    (200_000, 5_000_000), // base_slice_ns
-                    (512, 1536),          // vruntime_scale
-                    (50, 150),            // preemption_priority
-                    (5_000, 1_000_000),   // migration_cost
+                    (500_000, 2_000_000),    // latency_weight
+                    (1_000_000, 10_000_000), // base_slice_ns
+                    (1024, 2048),            // vruntime_scale
+                    (100, 100),              // preemption_priority
+                    (50_000, 500_000),       // migration_cost
                 ],
-                // HOG bounds
+                // HOG bounds - wide to prevent PIE getting stuck
                 [
-                    (100_000, 5_000_000), // latency_weight
-                    (200_000, 5_000_000), // base_slice_ns
-                    (512, 1536),          // vruntime_scale
-                    (50, 150),            // preemption_priority
-                    (5_000, 1_000_000),   // migration_cost
+                    (500_000, 2_000_000),    // latency_weight
+                    (1_000_000, 10_000_000), // base_slice_ns
+                    (1024, 2048),            // vruntime_scale
+                    (100, 100),              // preemption_priority
+                    (50_000, 500_000),       // migration_cost
                 ],
                 // BACKGROUND bounds
                 [
-                    (100_000, 5_000_000), // latency_weight
-                    (200_000, 5_000_000), // base_slice_ns
-                    (512, 1536),          // vruntime_scale
-                    (50, 150),            // preemption_priority
-                    (5_000, 1_000_000),   // migration_cost
+                    (500_000, 2_000_000),    // latency_weight
+                    (1_000_000, 10_000_000), // base_slice_ns
+                    (1024, 2048),            // vruntime_scale
+                    (100, 100),              // preemption_priority
+                    (50_000, 500_000),       // migration_cost
                 ],
             ],
             response_ms: 20, // Balanced response
@@ -292,39 +292,39 @@ impl Profile {
                 // BACKGROUND
                 [1_000_000, 5_000_000, 1536, 100, 100_000],
             ],
-            // Server: narrow bounds for stability
+            // Server: extra-wide bounds for maximum stability and throughput
             bounds: [
-                // LATENCY_CRITICAL bounds
+                // LATENCY_CRITICAL bounds - very wide
                 [
-                    (500_000, 2_000_000),    // latency_weight
-                    (1_000_000, 10_000_000), // base_slice_ns
-                    (1024, 2048),            // vruntime_scale
-                    (100, 100),              // preemption_priority (fixed)
-                    (50_000, 500_000),       // migration_cost
+                    (250_000, 5_000_000),  // latency_weight (wider)
+                    (500_000, 20_000_000), // base_slice_ns (0.5-20ms extra wide)
+                    (512, 3072),           // vruntime_scale (wider range)
+                    (50, 150),             // preemption_priority (some variation allowed)
+                    (25_000, 1_000_000),   // migration_cost (wider)
                 ],
                 // NORMAL bounds
                 [
-                    (500_000, 2_000_000),    // latency_weight
-                    (1_000_000, 10_000_000), // base_slice_ns
-                    (1024, 2048),            // vruntime_scale
-                    (100, 100),              // preemption_priority (fixed)
-                    (50_000, 500_000),       // migration_cost
+                    (250_000, 5_000_000),  // latency_weight
+                    (500_000, 20_000_000), // base_slice_ns
+                    (512, 3072),           // vruntime_scale
+                    (50, 150),             // preemption_priority
+                    (25_000, 1_000_000),   // migration_cost
                 ],
-                // HOG bounds
+                // HOG bounds - very wide for maximum flexibility
                 [
-                    (500_000, 2_000_000),    // latency_weight
-                    (1_000_000, 10_000_000), // base_slice_ns
-                    (1024, 2048),            // vruntime_scale
-                    (100, 100),              // preemption_priority (fixed)
-                    (50_000, 500_000),       // migration_cost
+                    (250_000, 5_000_000),  // latency_weight
+                    (500_000, 20_000_000), // base_slice_ns (extra wide for throughput tasks)
+                    (512, 3072),           // vruntime_scale
+                    (50, 150),             // preemption_priority
+                    (25_000, 1_000_000),   // migration_cost
                 ],
                 // BACKGROUND bounds
                 [
-                    (500_000, 2_000_000),    // latency_weight
-                    (1_000_000, 10_000_000), // base_slice_ns
-                    (1024, 2048),            // vruntime_scale
-                    (100, 100),              // preemption_priority (fixed)
-                    (50_000, 500_000),       // migration_cost
+                    (250_000, 5_000_000),  // latency_weight
+                    (500_000, 20_000_000), // base_slice_ns
+                    (512, 3072),           // vruntime_scale
+                    (50, 150),             // preemption_priority
+                    (25_000, 1_000_000),   // migration_cost
                 ],
             ],
             response_ms: 50, // Slower, stable response
