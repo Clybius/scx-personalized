@@ -14,7 +14,6 @@ mod autorate;
 mod classifier;
 mod optimizer_pie;
 mod profiles;
-mod safety;
 mod stats;
 
 use std::collections::HashSet;
@@ -44,7 +43,6 @@ use libbpf_rs::ProgramInput;
 use log::{debug, info, warn};
 use optimizer_pie::PieController;
 use profiles::Profile;
-use safety::SafetyMonitor;
 use scx_stats::prelude::*;
 use scx_utils::autopower::{fetch_power_profile, PowerProfile};
 use scx_utils::build_id;
@@ -349,16 +347,8 @@ pub struct ClassLossAccumulator {
                                // Implicit 4 bytes padding to align to 8-byte boundary
 }
 
-/// Size of class_loss_accumulator in bytes (matches BPF struct size)
-/// BPF struct: 4 x u64 (32 bytes) + 1 x u32 (4 bytes) + 4 bytes padding = 40 bytes
-const CLASS_LOSS_ACCUMULATOR_SIZE: usize = 40;
-
 /// Number of task classes
 const DESCENT_CLASS_MAX: usize = 4;
-
-/// Offset to class_loss array within cpu_descent_ctx
-/// class_params[4] = 4 * (5 * 8 bytes) = 160 bytes
-const CLASS_LOSS_OFFSET: usize = 160;
 
 /// Print detailed profile help showing all default values
 fn print_profile_help() {
@@ -523,7 +513,6 @@ struct Scheduler<'a> {
     pie: PieController,
     autorate: Option<AutorateController>, // NEW: None if --autorate not set
     _classifier: TaskClassifier,
-    safety: SafetyMonitor,
     profile: Profile,
     nr_cpus: usize,
 }
@@ -729,7 +718,6 @@ impl<'a> Scheduler<'a> {
         };
 
         let classifier = TaskClassifier::new();
-        let safety = SafetyMonitor::new();
 
         Ok(Self {
             skel,
@@ -742,7 +730,6 @@ impl<'a> Scheduler<'a> {
             pie,
             autorate,
             _classifier: classifier,
-            safety,
             profile,
             nr_cpus,
         })
@@ -920,14 +907,12 @@ impl<'a> Scheduler<'a> {
     fn get_metrics(&self) -> Metrics {
         let bss_data = self.skel.maps.bss_data.as_ref().unwrap();
 
-        // Get PIE stats
-        let pie_stats = self.pie.get_stats();
-
         // Calculate average latency across all states
         let mut total_latency = 0u64;
         let mut latency_count = 0u64;
         let mut total_integral = 0i64;
         let mut total_error = 0i64;
+        let mut total_updates = 0u64;
 
         for cpu in 0..self.nr_cpus as u32 {
             for class in 0..4u32 {
@@ -935,6 +920,7 @@ impl<'a> Scheduler<'a> {
                     total_latency += state.current_latency_ns;
                     latency_count += 1;
                     total_integral += state.integral_accum;
+                    total_updates += state.update_count;
 
                     let error = state.current_latency_ns as i64 - state.target_latency_ns as i64;
                     total_error += error;
@@ -982,7 +968,7 @@ impl<'a> Scheduler<'a> {
             nr_tasks_normal: 0,
             nr_tasks_hog: 0,
             nr_tasks_background: 0,
-            pie_updates: pie_stats.total_updates,
+            pie_updates: total_updates,
             pie_avg_latency_us: avg_latency / 1000, // Convert ns to µs
             pie_target_latency_us: 0,               // TODO: get from profile
             pie_integral: total_integral / 1024,    // De-scale
@@ -1375,90 +1361,6 @@ impl<'a> Scheduler<'a> {
         uei_exited!(&self.skel, uei)
     }
 
-    /// Read accumulated loss from BPF for a CPU/class using safe struct parsing
-    fn read_loss_from_bpf(&self, cpu: i32, class: u32) -> f64 {
-        if class as usize >= DESCENT_CLASS_MAX {
-            return 0.0;
-        }
-
-        // Use libbpf-rs to lookup per-CPU element
-        let key: u32 = 0;
-
-        match self
-            .skel
-            .maps
-            .cpu_descent_ctx_stor
-            .lookup_percpu(&key.to_ne_bytes(), MapFlags::ANY)
-        {
-            Ok(Some(values)) => {
-                // values is Vec<Vec<u8>> where each element is data for a CPU
-                // Get the specific CPU's data
-                let cpu_idx = cpu as usize;
-                if cpu_idx >= values.len() {
-                    return 0.0;
-                }
-                let data = &values[cpu_idx];
-
-                // Calculate offset to this class's class_loss[class_id]
-                let class_offset =
-                    CLASS_LOSS_OFFSET + (class as usize * CLASS_LOSS_ACCUMULATOR_SIZE);
-
-                // Ensure we have enough data
-                if data.len() < class_offset + CLASS_LOSS_ACCUMULATOR_SIZE {
-                    return 0.0;
-                }
-
-                // Parse the ClassLossAccumulator fields using safe byte conversion
-                let accumulator_data =
-                    &data[class_offset..class_offset + CLASS_LOSS_ACCUMULATOR_SIZE];
-
-                // Helper to safely extract u64 from native-endian bytes
-                fn read_u64(bytes: &[u8]) -> u64 {
-                    if bytes.len() >= 8 {
-                        u64::from_ne_bytes([
-                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-                            bytes[7],
-                        ])
-                    } else {
-                        0
-                    }
-                }
-
-                // Helper to safely extract u32 from native-endian bytes
-                fn read_u32(bytes: &[u8]) -> u32 {
-                    if bytes.len() >= 4 {
-                        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                    } else {
-                        0
-                    }
-                }
-
-                let accum = ClassLossAccumulator {
-                    latency_loss_sum: read_u64(&accumulator_data[0..8]),
-                    deadline_misses: read_u64(&accumulator_data[8..16]),
-                    cpu_time_ns: read_u64(&accumulator_data[16..24]),
-                    target_share_ns: read_u64(&accumulator_data[24..32]),
-                    sample_count: read_u32(&accumulator_data[32..36]), // sample_count is at offset 32-36 (after 4 u64 fields)
-                };
-
-                // Compute composite loss (same formula as BPF)
-                if accum.sample_count == 0 {
-                    return 0.0;
-                }
-
-                let avg_latency_loss = accum.latency_loss_sum / accum.sample_count as u64;
-                let deadline_penalty = accum.deadline_misses * 10; // 10ms per miss
-
-                (avg_latency_loss + deadline_penalty) as f64
-            }
-            Ok(None) => 0.0,
-            Err(e) => {
-                eprintln!("Error reading loss from BPF: {:?}", e);
-                0.0
-            }
-        }
-    }
-
     /// Read latency metrics from BPF for a CPU/class for PIE controller
     fn read_latency_metrics(&self, cpu: i32, class: u32) -> LatencyMetrics {
         if class as usize >= DESCENT_CLASS_MAX {
@@ -1840,10 +1742,20 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let stats = self.pie.get_stats();
+        // Calculate global stats manually
+        let mut total_states = 0usize;
+        let mut total_updates = 0u64;
+        for cpu in 0..self.nr_cpus {
+            for class in 0..4u32 {
+                if let Some(state) = self.pie.get_state(cpu as u32, class) {
+                    total_states += 1;
+                    total_updates += state.update_count;
+                }
+            }
+        }
         eprintln!(
             "\nGlobal: {} states, {} updates",
-            stats.total_states, stats.total_updates
+            total_states, total_updates
         );
     }
 

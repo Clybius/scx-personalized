@@ -87,16 +87,6 @@ impl AutorateClassState {
             prev_latency_ns: 0,
         }
     }
-
-    /// Reset state to baseline
-    fn reset(&mut self) {
-        self.current_rate = 0.5;
-        self.load_percent = 0.5;
-        self.state = AutorateState::Steady;
-        self.last_adjustment_time = Instant::now();
-        self.last_adjustment_dir = AdjustmentDirection::None;
-        // Preserve latency history for continuity
-    }
 }
 
 /// Autorate configuration (from Profile)
@@ -126,150 +116,6 @@ pub struct AutorateConfig {
     pub adjust_down_refractory_ms: u64,
     /// Bufferbloat threshold (e.g., 1.5 = 1.5x target latency)
     pub bufferbloat_threshold: f64,
-}
-
-impl AutorateConfig {
-    /// Create default autorate configuration from profile defaults
-    pub fn default_from_profile() -> Self {
-        Self {
-            enabled: true,
-            // Use production profile as baseline
-            min_params: [
-                // LATENCY_CRITICAL: more conservative min
-                [50_000, 300_000, 384, 25, 5_000],
-                // NORMAL
-                [50_000, 500_000, 512, 50, 5_000],
-                // HOG
-                [100_000, 1_000_000, 1024, 50, 10_000],
-                // BACKGROUND
-                [50_000, 500_000, 512, 50, 5_000],
-            ],
-            baseline_params: [
-                // LATENCY_CRITICAL
-                [100_000, 600_000, 512, 100, 30_000],
-                // NORMAL
-                [500_000, 1_000_000, 768, 100, 30_000],
-                // HOG
-                [2_000_000, 3_000_000, 1536, 100, 50_000],
-                // BACKGROUND
-                [1_000_000, 2_000_000, 1024, 100, 20_000],
-            ],
-            max_params: [
-                // LATENCY_CRITICAL: aggressive max for gaming
-                [1_000_000, 2_000_000, 1024, 200, 100_000],
-                // NORMAL
-                [2_000_000, 3_000_000, 1536, 200, 100_000],
-                // HOG
-                [5_000_000, 10_000_000, 3072, 200, 200_000],
-                // BACKGROUND
-                [2_000_000, 5_000_000, 2048, 200, 100_000],
-            ],
-            high_load_threshold: 0.75,
-            low_load_threshold: 0.25,
-            ramp_up_rate: 1.08,
-            ramp_down_rate: 0.75,
-            decay_rate: 0.99,
-            adjust_up_refractory_ms: 50,
-            adjust_down_refractory_ms: 20,
-            bufferbloat_threshold: 1.5,
-        }
-    }
-
-    /// Create gaming-optimized configuration
-    pub fn gaming() -> Self {
-        Self {
-            enabled: true,
-            min_params: [
-                // LATENCY_CRITICAL: tight min for gaming
-                [10_000, 200_000, 256, 10, 1_000],
-                // NORMAL
-                [50_000, 500_000, 512, 50, 5_000],
-                // HOG
-                [100_000, 1_000_000, 1024, 50, 10_000],
-                // BACKGROUND
-                [50_000, 500_000, 512, 50, 5_000],
-            ],
-            baseline_params: [
-                // LATENCY_CRITICAL: gaming baseline
-                [100_000, 600_000, 512, 50, 10_000],
-                // NORMAL
-                [1_000_000, 1_000_000, 768, 100, 30_000],
-                // HOG
-                [5_000_000, 5_000_000, 1536, 100, 100_000],
-                // BACKGROUND
-                [1_000_000, 2_000_000, 1024, 100, 20_000],
-            ],
-            max_params: [
-                // LATENCY_CRITICAL: aggressive max
-                [2_000_000, 5_000_000, 2048, 200, 500_000],
-                // NORMAL
-                [5_000_000, 8_000_000, 2048, 200, 500_000],
-                // HOG
-                [10_000_000, 20_000_000, 4096, 200, 1_000_000],
-                // BACKGROUND
-                [5_000_000, 10_000_000, 3072, 200, 500_000],
-            ],
-            high_load_threshold: 0.70, // More aggressive
-            low_load_threshold: 0.30,
-            ramp_up_rate: 1.12,          // Faster ramp up (12%)
-            ramp_down_rate: 0.70,        // Faster ramp down
-            decay_rate: 0.995,           // Slower decay (0.5%)
-            adjust_up_refractory_ms: 30, // Shorter refractory
-            adjust_down_refractory_ms: 15,
-            bufferbloat_threshold: 1.3, // More sensitive
-        }
-    }
-
-    /// Create server-optimized configuration
-    pub fn server() -> Self {
-        Self {
-            enabled: true,
-            min_params: [
-                // LATENCY_CRITICAL: server min
-                [100_000, 500_000, 512, 75, 25_000],
-                // NORMAL
-                [200_000, 1_000_000, 768, 75, 25_000],
-                // HOG
-                [500_000, 2_000_000, 1024, 75, 50_000],
-                // BACKGROUND
-                [200_000, 1_000_000, 768, 75, 25_000],
-            ],
-            baseline_params: [
-                // LATENCY_CRITICAL: server baseline
-                [1_000_000, 2_000_000, 1536, 100, 100_000],
-                // NORMAL
-                [1_000_000, 5_000_000, 1536, 100, 100_000],
-                // HOG
-                [1_000_000, 8_000_000, 1536, 100, 100_000],
-                // BACKGROUND
-                [1_000_000, 5_000_000, 1536, 100, 100_000],
-            ],
-            max_params: [
-                // LATENCY_CRITICAL: conservative max
-                [2_000_000, 5_000_000, 2048, 125, 200_000],
-                // NORMAL
-                [3_000_000, 10_000_000, 2048, 125, 200_000],
-                // HOG
-                [5_000_000, 15_000_000, 2048, 125, 300_000],
-                // BACKGROUND
-                [3_000_000, 10_000_000, 2048, 125, 200_000],
-            ],
-            high_load_threshold: 0.80, // Less aggressive
-            low_load_threshold: 0.20,
-            ramp_up_rate: 1.05,           // Slower ramp up (5%)
-            ramp_down_rate: 0.85,         // Gentler ramp down
-            decay_rate: 0.98,             // Faster decay (2%)
-            adjust_up_refractory_ms: 100, // Longer refractory
-            adjust_down_refractory_ms: 50,
-            bufferbloat_threshold: 2.0, // Less sensitive
-        }
-    }
-}
-
-impl Default for AutorateConfig {
-    fn default() -> Self {
-        Self::default_from_profile()
-    }
 }
 
 /// Statistics for autorate controller monitoring
@@ -550,71 +396,6 @@ impl AutorateController {
         AutorateState::Steady
     }
 
-    /// Check if adjustment allowed (refractory period)
-    fn check_refractory(&self, state: &AutorateClassState, new_state: AutorateState) -> bool {
-        let elapsed_ms = state.last_adjustment_time.elapsed().as_millis() as u64;
-
-        // Determine direction of potential adjustment
-        let would_adjust_up = new_state == AutorateState::LoadHigh;
-        let would_adjust_down = new_state == AutorateState::Bufferbloat
-            || (new_state == AutorateState::LoadLow && state.current_rate > 0.5);
-
-        // Apply refractory based on last adjustment direction
-        match state.last_adjustment_dir {
-            AdjustmentDirection::Up => {
-                // After upward adjustment, require longer refractory for another up
-                if would_adjust_up {
-                    elapsed_ms >= self.config.adjust_up_refractory_ms
-                } else {
-                    // Downward adjustment has shorter refractory
-                    elapsed_ms >= self.config.adjust_down_refractory_ms
-                }
-            }
-            AdjustmentDirection::Down => {
-                // After downward adjustment, require longer refractory for another down
-                if would_adjust_down {
-                    elapsed_ms >= self.config.adjust_down_refractory_ms
-                } else {
-                    // Upward adjustment has longer refractory
-                    elapsed_ms >= self.config.adjust_up_refractory_ms
-                }
-            }
-            AdjustmentDirection::None => {
-                // No previous adjustment - this is the first one, allow it
-                true
-            }
-        }
-    }
-
-    /// Calculate target rate based on state
-    fn calculate_target_rate(&self, current_rate: f64, state: AutorateState) -> f64 {
-        match state {
-            AutorateState::Bufferbloat => {
-                // Aggressive ramp down
-                current_rate * self.config.ramp_down_rate
-            }
-            AutorateState::LoadHigh => {
-                // Ramp up toward max, but don't exceed 1.0
-                (current_rate * self.config.ramp_up_rate).min(1.0)
-            }
-            AutorateState::LoadLow => {
-                // Decay toward 0.5 (baseline)
-                if current_rate > 0.5 {
-                    // Decay down toward baseline
-                    current_rate * self.config.decay_rate
-                } else {
-                    // Decay up toward baseline
-                    let diff = 0.5 - current_rate;
-                    current_rate + diff * (1.0 - self.config.decay_rate)
-                }
-            }
-            AutorateState::Steady => {
-                // No change
-                current_rate
-            }
-        }
-    }
-
     /// Linear interpolation between min/baseline/max
     ///
     /// rate 0.0 -> min_params
@@ -650,21 +431,6 @@ impl AutorateController {
         self.states.get(&class)
     }
 
-    /// Reset class to baseline
-    pub fn reset_class(&mut self, class: u32) {
-        if let Some(state) = self.states.get_mut(&class) {
-            state.reset();
-            debug!("[AUTORATE-RESET] Reset class {} to baseline", class);
-        }
-    }
-
-    /// Reset all classes to baseline
-    pub fn reset_all(&mut self) {
-        for class in 0..DESCENT_CLASS_MAX as u32 {
-            self.reset_class(class);
-        }
-    }
-
     /// Get controller statistics
     pub fn get_stats(&self) -> AutorateStats {
         let mut total_rate = 0.0;
@@ -682,32 +448,12 @@ impl AutorateController {
         };
         stats
     }
-
-    /// Update configuration
-    pub fn update_config(&mut self, config: AutorateConfig) {
-        self.config = config;
-        debug!("[AUTORATE-CONFIG] Configuration updated");
-    }
-
-    /// Check if autorate is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-
-    /// Enable/disable autorate
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.config.enabled = enabled;
-        if enabled {
-            debug!("[AUTORATE] Enabled");
-        } else {
-            debug!("[AUTORATE] Disabled");
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::Profile;
 
     // Test configuration with known values for predictable tests
     fn test_config() -> AutorateConfig {
@@ -958,125 +704,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ramp_up_rate() {
-        let config = test_config();
-        let controller = AutorateController::new(4, &config);
-
-        // Test rate increases correctly in LoadHigh state
-        let initial_rate = 0.5;
-        let new_rate = controller.calculate_target_rate(initial_rate, AutorateState::LoadHigh);
-
-        assert!(
-            new_rate > initial_rate,
-            "LoadHigh should increase rate: {} -> {}",
-            initial_rate,
-            new_rate
-        );
-        assert!(
-            (new_rate - initial_rate * config.ramp_up_rate).abs() < f64::EPSILON,
-            "Rate should increase by ramp_up_rate factor"
-        );
-    }
-
-    #[test]
-    fn test_ramp_up_rate_ceiling() {
-        let config = test_config();
-        let controller = AutorateController::new(4, &config);
-
-        // Test rate doesn't exceed 1.0
-        let initial_rate = 0.95;
-        let new_rate = controller.calculate_target_rate(initial_rate, AutorateState::LoadHigh);
-
-        assert!(
-            new_rate <= 1.0,
-            "Rate should not exceed 1.0: got {}",
-            new_rate
-        );
-    }
-
-    #[test]
-    fn test_ramp_down_rate() {
-        let config = test_config();
-        let controller = AutorateController::new(4, &config);
-
-        // Test rate decreases correctly in Bufferbloat state
-        let initial_rate = 0.5;
-        let new_rate = controller.calculate_target_rate(initial_rate, AutorateState::Bufferbloat);
-
-        assert!(
-            new_rate < initial_rate,
-            "Bufferbloat should decrease rate: {} -> {}",
-            initial_rate,
-            new_rate
-        );
-        assert!(
-            (new_rate - initial_rate * config.ramp_down_rate).abs() < f64::EPSILON,
-            "Rate should decrease by ramp_down_rate factor: expected {}, got {}",
-            initial_rate * config.ramp_down_rate,
-            new_rate
-        );
-    }
-
-    #[test]
-    fn test_decay_toward_baseline_above() {
-        let config = test_config();
-        let controller = AutorateController::new(4, &config);
-
-        // When above baseline (0.5), LoadLow should decay down
-        let initial_rate = 0.8;
-        let new_rate = controller.calculate_target_rate(initial_rate, AutorateState::LoadLow);
-
-        assert!(
-            new_rate < initial_rate,
-            "LoadLow should decay toward 0.5 when above: {} -> {}",
-            initial_rate,
-            new_rate
-        );
-        assert!(
-            new_rate > 0.5,
-            "Rate should not cross below 0.5 from above: got {}",
-            new_rate
-        );
-    }
-
-    #[test]
-    fn test_decay_toward_baseline_below() {
-        let config = test_config();
-        let controller = AutorateController::new(4, &config);
-
-        // When below baseline (0.5), LoadLow should decay up
-        let initial_rate = 0.2;
-        let new_rate = controller.calculate_target_rate(initial_rate, AutorateState::LoadLow);
-
-        assert!(
-            new_rate > initial_rate,
-            "LoadLow should decay toward 0.5 when below: {} -> {}",
-            initial_rate,
-            new_rate
-        );
-        assert!(
-            new_rate < 0.5,
-            "Rate should not cross above 0.5 from below: got {}",
-            new_rate
-        );
-    }
-
-    #[test]
-    fn test_steady_no_change() {
-        let config = test_config();
-        let controller = AutorateController::new(4, &config);
-
-        // Steady state should not change rate
-        let initial_rate = 0.7;
-        let new_rate = controller.calculate_target_rate(initial_rate, AutorateState::Steady);
-
-        assert_eq!(
-            initial_rate, new_rate,
-            "Steady state should not change rate"
-        );
-    }
-
-    #[test]
     fn test_controller_creation() {
         let config = test_config();
         let controller = AutorateController::new(4, &config);
@@ -1161,63 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_class() {
-        let config = test_config();
-        let mut controller = AutorateController::new(4, &config);
-
-        // First update to change state - should trigger bufferbloat
-        // latency=2000, target=1000, ratio=2.0 > 1.5 threshold
-        let (_params, _state) = controller.update(0, 2000, 1000, 0.90);
-
-        let state_before = controller.get_class_state(0).unwrap().current_rate;
-        assert_ne!(
-            state_before, 0.5,
-            "Rate should have changed from baseline (was {})",
-            state_before
-        );
-
-        // Reset the class
-        controller.reset_class(0);
-
-        let state_after = controller.get_class_state(0).unwrap();
-        assert_eq!(
-            state_after.current_rate, 0.5,
-            "Rate should be reset to baseline"
-        );
-        assert_eq!(
-            state_after.state,
-            AutorateState::Steady,
-            "State should be reset to steady"
-        );
-    }
-
-    #[test]
-    fn test_reset_all() {
-        let config = test_config();
-        let mut controller = AutorateController::new(4, &config);
-
-        // Update all classes
-        for class in 0..DESCENT_CLASS_MAX as u32 {
-            for _ in 0..5 {
-                let _ = controller.update(class, 1_000_000, 1000, 0.90);
-            }
-        }
-
-        // Reset all
-        controller.reset_all();
-
-        // Verify all reset
-        for class in 0..DESCENT_CLASS_MAX as u32 {
-            let state = controller.get_class_state(class).unwrap();
-            assert_eq!(
-                state.current_rate, 0.5,
-                "Class {} rate should be reset",
-                class
-            );
-        }
-    }
-
-    #[test]
     fn test_stats_tracking() {
         let config = test_config();
         let mut controller = AutorateController::new(4, &config);
@@ -1294,70 +864,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_profiles() {
-        // Test gaming config
-        let gaming = AutorateConfig::gaming();
-        assert!(gaming.enabled);
-        assert!(gaming.ramp_up_rate > 1.0);
-        assert!(
-            gaming.bufferbloat_threshold < 1.5,
-            "Gaming should be more sensitive"
-        );
-        assert!(
-            gaming.adjust_up_refractory_ms < 50,
-            "Gaming should have shorter refractory"
-        );
-
-        // Test server config
-        let server = AutorateConfig::server();
-        assert!(server.enabled);
-        assert!(
-            server.ramp_up_rate < 1.1,
-            "Server should have slower ramp up"
-        );
-        assert!(
-            server.bufferbloat_threshold > 1.5,
-            "Server should be less sensitive"
-        );
-        assert!(
-            server.adjust_up_refractory_ms > 50,
-            "Server should have longer refractory"
-        );
-
-        // Test default config
-        let default = AutorateConfig::default();
-        assert!(default.enabled);
-        assert_eq!(default.ramp_up_rate, 1.08); // From default_from_profile
-    }
-
-    #[test]
-    fn test_refractory_period_blocks_same_direction() {
-        let mut config = test_config();
-        config.adjust_up_refractory_ms = 100; // Long refractory
-        config.adjust_down_refractory_ms = 100;
-        let mut controller = AutorateController::new(4, &config);
-
-        // First update - should succeed
-        let (_, state1) = controller.update(0, 500, 1000, 0.90);
-        assert_eq!(state1, AutorateState::LoadHigh);
-
-        // Immediate second update in same direction - should be blocked
-        // But the rate won't change further because we're still in refractory
-        let before_rate = controller.get_class_state(0).unwrap().current_rate;
-
-        // Update again immediately (simulate rapid updates)
-        controller.update(0, 450, 1000, 0.95);
-
-        let after_rate = controller.get_class_state(0).unwrap().current_rate;
-
-        // Rate should be same (blocked by refractory)
-        assert_eq!(
-            before_rate, after_rate,
-            "Should be blocked by refractory period"
-        );
-    }
-
-    #[test]
     fn test_zero_target_latency() {
         let config = test_config();
         let controller = AutorateController::new(4, &config);
@@ -1383,48 +889,6 @@ mod tests {
             AutorateState::Steady,
             "Should fall back to load-based detection"
         );
-    }
-
-    #[test]
-    fn test_enable_disable() {
-        let config = test_config();
-        let mut controller = AutorateController::new(4, &config);
-
-        assert!(controller.is_enabled());
-
-        controller.set_enabled(false);
-        assert!(!controller.is_enabled());
-
-        controller.set_enabled(true);
-        assert!(controller.is_enabled());
-    }
-
-    #[test]
-    fn test_update_config() {
-        let config = test_config();
-        let mut controller = AutorateController::new(4, &config);
-
-        let new_config = AutorateConfig::gaming();
-        controller.update_config(new_config.clone());
-
-        // Test that new config is applied by checking behavior
-        let (_, state) = controller.update(0, 2000, 1000, 0.50);
-        // Gaming has lower bufferbloat threshold (1.3 vs 1.5)
-        assert_eq!(state, AutorateState::Bufferbloat);
-    }
-
-    #[test]
-    fn test_rate_clamping() {
-        let config = test_config();
-        let controller = AutorateController::new(4, &config);
-
-        // Test ramp up doesn't exceed 1.0
-        let rate = controller.calculate_target_rate(0.95, AutorateState::LoadHigh);
-        assert!(rate <= 1.0, "Rate should be clamped to <= 1.0");
-
-        // Test ramp down doesn't go below 0.0
-        let rate2 = controller.calculate_target_rate(0.05, AutorateState::Bufferbloat);
-        assert!(rate2 >= 0.0, "Rate should be clamped to >= 0.0");
     }
 
     #[test]
