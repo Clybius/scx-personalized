@@ -10,7 +10,7 @@ pub use bpf_skel::*;
 pub mod bpf_intf;
 pub use bpf_intf::*;
 
-mod autorate;
+mod bound_debug;
 mod classifier;
 mod optimizer_pie;
 mod profiles;
@@ -32,7 +32,6 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use autorate::{AutorateController, AutorateState};
 use clap::Parser;
 use classifier::TaskClassifier;
 use crossbeam::channel::RecvTimeoutError;
@@ -219,13 +218,9 @@ struct Opts {
     #[clap(long, value_name = "N")]
     debug_pie: Option<u64>,
 
-    /// Enable CAKE Autorate for adaptive parameter tuning
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    autorate: bool,
-
-    /// Enable autorate debug output every N ms
+    /// Enable parameter bounds debugging - tracks when parameters hit min/max bounds
     #[clap(long, value_name = "N")]
-    debug_autorate: Option<u64>,
+    debug_bounds: Option<u64>,
 
     /// Override profile response interval (ms). Lower = faster updates, higher = more stable.
     /// Profile defaults: gaming=20, production=20, server=50
@@ -261,31 +256,6 @@ struct Opts {
     /// Profile defaults: gaming=50000, production=100000, server=200000
     #[clap(long, value_name = "MICROSECONDS")]
     target_latency_background: Option<u64>,
-
-    /// Autorate: high load threshold (0.0-1.0). Load above this triggers ramp up.
-    /// Profile defaults: gaming=0.75, production=0.75, server=0.80
-    #[clap(long, value_name = "FRACTION")]
-    autorate_high_load: Option<f64>,
-
-    /// Autorate: low load threshold (0.0-1.0). Load below this triggers ramp down.
-    /// Profile defaults: gaming=0.25, production=0.25, server=0.30
-    #[clap(long, value_name = "FRACTION")]
-    autorate_low_load: Option<f64>,
-
-    /// Autorate: ramp up rate multiplier (e.g., 1.04 = 4% increase).
-    /// Profile defaults: gaming=1.04, production=1.08, server=1.02
-    #[clap(long, value_name = "RATE")]
-    autorate_ramp_up: Option<f64>,
-
-    /// Autorate: ramp down rate multiplier (e.g., 0.85 = 15% decrease).
-    /// Profile defaults: gaming=0.85, production=0.85, server=0.90
-    #[clap(long, value_name = "RATE")]
-    autorate_ramp_down: Option<f64>,
-
-    /// Autorate: decay rate toward baseline (e.g., 0.99 = 1% per interval).
-    /// Profile defaults: gaming=0.99, production=0.99, server=0.995
-    #[clap(long, value_name = "RATE")]
-    autorate_decay: Option<f64>,
 
     /// Show detailed profile parameter defaults and exit
     #[clap(long, action = clap::ArgAction::SetTrue, help_heading = "Help")]
@@ -397,70 +367,6 @@ fn print_profile_help() {
     }
     println!();
 
-    // Autorate Parameters (only for gaming/production - server has enabled=false)
-    println!("CAKE Autorate Parameters:");
-    println!(
-        "  {:30} {:>12} {:>15} {:>15}",
-        "Parameter", "Gaming", "Production", "Server"
-    );
-    println!(
-        "  {:30} {:>12.2} {:>15.2} {:>15.2}",
-        "high_load_threshold",
-        gaming.autorate.high_load_threshold,
-        prod.autorate.high_load_threshold,
-        server.autorate.high_load_threshold
-    );
-    println!(
-        "  {:30} {:>12.2} {:>15.2} {:>15.2}",
-        "low_load_threshold",
-        gaming.autorate.low_load_threshold,
-        prod.autorate.low_load_threshold,
-        server.autorate.low_load_threshold
-    );
-    println!(
-        "  {:30} {:>12.2} {:>15.2} {:>15.2}",
-        "ramp_up_rate",
-        gaming.autorate.ramp_up_rate,
-        prod.autorate.ramp_up_rate,
-        server.autorate.ramp_up_rate
-    );
-    println!(
-        "  {:30} {:>12.2} {:>15.2} {:>15.2}",
-        "ramp_down_rate",
-        gaming.autorate.ramp_down_rate,
-        prod.autorate.ramp_down_rate,
-        server.autorate.ramp_down_rate
-    );
-    println!(
-        "  {:30} {:>12.3} {:>15.3} {:>15.3}",
-        "decay_rate",
-        gaming.autorate.decay_rate,
-        prod.autorate.decay_rate,
-        server.autorate.decay_rate
-    );
-    println!(
-        "  {:30} {:>12} {:>15} {:>15}",
-        "refractory_up_ms",
-        gaming.autorate.adjust_up_refractory_ms,
-        prod.autorate.adjust_up_refractory_ms,
-        server.autorate.adjust_up_refractory_ms
-    );
-    println!(
-        "  {:30} {:>12} {:>15} {:>15}",
-        "refractory_down_ms",
-        gaming.autorate.adjust_down_refractory_ms,
-        prod.autorate.adjust_down_refractory_ms,
-        server.autorate.adjust_down_refractory_ms
-    );
-    println!(
-        "  {:30} {:>12.1} {:>15.1} {:>15.1}",
-        "bufferbloat_threshold",
-        gaming.autorate.bufferbloat_threshold,
-        prod.autorate.bufferbloat_threshold,
-        server.autorate.bufferbloat_threshold
-    );
-    println!();
-
     // Profile descriptions
     println!("Profile Descriptions:");
     println!("  gaming:       Optimized for low-latency audio, games, and compositors.");
@@ -483,14 +389,6 @@ pub struct LatencyMetrics {
     pub sample_count: u64,
 }
 
-/// Load metrics structure
-#[derive(Debug, Default)]
-pub struct LoadMetrics {
-    pub cycles_spent: u64,
-    pub sample_count: u64,
-    pub last_update_ns: u64,
-}
-
 /// Helper to safely extract u64 from native-endian bytes
 fn read_u64(bytes: &[u8]) -> u64 {
     if bytes.len() >= 8 {
@@ -511,10 +409,10 @@ struct Scheduler<'a> {
     stats_server: StatsServer<(), Metrics>,
     user_restart: bool,
     pie: PieController,
-    autorate: Option<AutorateController>, // NEW: None if --autorate not set
     _classifier: TaskClassifier,
     profile: Profile,
     nr_cpus: usize,
+    last_bounds_debug: std::time::Instant,
 }
 
 impl<'a> Scheduler<'a> {
@@ -573,31 +471,6 @@ impl<'a> Scheduler<'a> {
         if let Some(latency_us) = opts.target_latency_background {
             profile.target_latencies_ns[3] = latency_us * 1000;
             info!("Override: target_latency_background = {}µs", latency_us);
-        }
-
-        // Apply autorate overrides if autorate is enabled
-        if opts.autorate {
-            profile.autorate.enabled = true; // Enable autorate in profile config
-            if let Some(threshold) = opts.autorate_high_load {
-                profile.autorate.high_load_threshold = threshold;
-                info!("Override: autorate_high_load = {:.2}", threshold);
-            }
-            if let Some(threshold) = opts.autorate_low_load {
-                profile.autorate.low_load_threshold = threshold;
-                info!("Override: autorate_low_load = {:.2}", threshold);
-            }
-            if let Some(rate) = opts.autorate_ramp_up {
-                profile.autorate.ramp_up_rate = rate;
-                info!("Override: autorate_ramp_up = {:.2}", rate);
-            }
-            if let Some(rate) = opts.autorate_ramp_down {
-                profile.autorate.ramp_down_rate = rate;
-                info!("Override: autorate_ramp_down = {:.2}", rate);
-            }
-            if let Some(rate) = opts.autorate_decay {
-                profile.autorate.decay_rate = rate;
-                info!("Override: autorate_decay = {:.3}", rate);
-            }
         }
 
         info!("Using profile: {}", profile);
@@ -706,16 +579,13 @@ impl<'a> Scheduler<'a> {
         let struct_ops = Some(scx_ops_attach!(skel, descent_ops)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
-        // Initialize Phase 4 components - PIE Controller and Autorate
-        let pie = PieController::new(nr_cpus, &profile);
+        // Initialize Phase 4 components - PIE Controller
+        let mut pie = PieController::new(nr_cpus, &profile);
 
-        // Initialize autorate if enabled
-        let autorate = if opts.autorate {
-            info!("CAKE Autorate enabled");
-            Some(AutorateController::new(nr_cpus, &profile.autorate))
-        } else {
-            None
-        };
+        // Enable bound debugging if requested
+        if opts.debug_bounds.is_some() {
+            pie.set_bound_debugging(true);
+        }
 
         let classifier = TaskClassifier::new();
 
@@ -728,10 +598,10 @@ impl<'a> Scheduler<'a> {
             stats_server,
             user_restart: false,
             pie,
-            autorate,
             _classifier: classifier,
             profile,
             nr_cpus,
+            last_bounds_debug: std::time::Instant::now(),
         })
     }
 
@@ -939,23 +809,6 @@ impl<'a> Scheduler<'a> {
             0
         };
 
-        // Get autorate stats if enabled
-        let (autorate_enabled, autorate_state, autorate_rate) =
-            if let Some(ref autorate) = self.autorate {
-                // Get state from class 0 as representative
-                if let Some(state) = autorate.get_class_state(0) {
-                    (
-                        1u64,
-                        state.state as u64,
-                        (state.current_rate * 100.0) as u64,
-                    )
-                } else {
-                    (1u64, 0, 50) // Default to steady, mid-rate
-                }
-            } else {
-                (0u64, 0, 0)
-            };
-
         Metrics {
             nr_running: bss_data.nr_running,
             nr_cpus: bss_data.nr_online_cpus,
@@ -973,10 +826,6 @@ impl<'a> Scheduler<'a> {
             pie_target_latency_us: 0,               // TODO: get from profile
             pie_integral: total_integral / 1024,    // De-scale
             pie_latency_error_us: avg_error / 1000, // Convert to µs
-            // Autorate metrics
-            autorate_enabled,
-            autorate_state,
-            autorate_rate_percent: autorate_rate,
         }
     }
 
@@ -1563,86 +1412,6 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Read load metrics from BPF for a CPU/class
-    fn read_load_metrics(&self, cpu: i32, class: u32) -> LoadMetrics {
-        if class as usize >= DESCENT_CLASS_MAX {
-            return LoadMetrics::default();
-        }
-
-        let key: u32 = 0;
-
-        match self
-            .skel
-            .maps
-            .cpu_descent_ctx_stor
-            .lookup_percpu(&key.to_ne_bytes(), MapFlags::ANY)
-        {
-            Ok(Some(values)) => {
-                let cpu_idx = cpu as usize;
-                if cpu_idx >= values.len() {
-                    return LoadMetrics::default();
-                }
-                let data = &values[cpu_idx];
-
-                // Calculate offset to class_load[class_id]
-                // class_params[4] = 160 bytes
-                // class_latency[4] = 96 bytes (24 bytes each)
-                // class_load starts after = 256 bytes
-                let class_offset = 256 + (class as usize * 24); // 24 bytes per load_accumulator
-
-                if data.len() < class_offset + 24 {
-                    return LoadMetrics::default();
-                }
-
-                let load_data = &data[class_offset..class_offset + 24];
-
-                LoadMetrics {
-                    cycles_spent: read_u64(&load_data[0..8]),
-                    sample_count: read_u64(&load_data[8..16]),
-                    last_update_ns: read_u64(&load_data[16..24]),
-                }
-            }
-            Ok(None) => LoadMetrics::default(),
-            Err(_) => LoadMetrics::default(),
-        }
-    }
-
-    /// Reset load accumulators for a class across all CPUs via BPF syscall
-    fn reset_load_accumulators(&mut self, class: u32) {
-        let prog = &mut self.skel.progs.reset_load_accumulators;
-
-        let mut args = reset_load_args {
-            cpu_id: -1, // All CPUs
-            class_id: class,
-        };
-
-        let input = ProgramInput {
-            context_in: Some(unsafe {
-                std::slice::from_raw_parts_mut(
-                    &mut args as *mut _ as *mut u8,
-                    std::mem::size_of_val(&args),
-                )
-            }),
-            ..Default::default()
-        };
-
-        match prog.test_run(input) {
-            Ok(out) => {
-                if out.return_value != 0 {
-                    warn!(
-                        "Failed to reset load accumulators for class {}: {}",
-                        class, out.return_value
-                    );
-                } else {
-                    debug!("Reset load accumulators for class {}", class);
-                }
-            }
-            Err(e) => {
-                warn!("Error resetting load accumulators: {}", e);
-            }
-        }
-    }
-
     /// Update BPF class parameters using syscall program
     fn update_bpf_params(&mut self, cpu: i32, class: u32, params: [u64; 5]) {
         let prog = &mut self.skel.progs.update_class_params;
@@ -1856,22 +1625,17 @@ impl<'a> Scheduler<'a> {
 
             // Phase 4: PIE Controller update cycle
             if last_update.elapsed() >= update_interval {
-                if self.opts.autorate {
-                    // TWO-STAGE: Autorate + PIE
-                    self.update_autorate_and_pie();
-                } else {
-                    // PIE ONLY (original behavior)
-                    self.update_pie_only();
-                }
+                // PIE Controller update
+                self.update_pie();
 
                 // Optional: Debug output
                 if self.opts.debug_pie.is_some() {
                     self.output_pie_debug();
                 }
 
-                // Optional: Autorate debug output
-                if self.opts.debug_autorate.is_some() {
-                    self.output_autorate_debug();
+                // Optional: Bounds debug output
+                if self.opts.debug_bounds.is_some() {
+                    self.output_bounds_debug();
                 }
 
                 last_update = Instant::now();
@@ -1964,121 +1728,8 @@ impl<'a> Scheduler<'a> {
         );
     }
 
-    /// Stage 1: Autorate (per-class) + Stage 2: PIE (per-CPU)
-    fn update_autorate_and_pie(&mut self) {
-        // ─────────────────────────────────────────────────────────
-        // STAGE 1: Aggregate metrics and run Autorate per-class
-        // ─────────────────────────────────────────────────────────
-
-        let mut class_metrics: [(u64, u64, u64); 4] = [(0, 0, 0); 4];
-        // (total_latency_ns, latency_count, total_cycles)
-
-        // Aggregate across all CPUs per class
-        for cpu in 0..self.nr_cpus {
-            for class in 0..4u32 {
-                let latency = self.read_latency_metrics(cpu as i32, class);
-                let load = self.read_load_metrics(cpu as i32, class);
-
-                class_metrics[class as usize].0 += latency.total_latency_ns;
-                class_metrics[class as usize].1 += latency.sample_count;
-                class_metrics[class as usize].2 += load.cycles_spent;
-            }
-        }
-
-        // Run Autorate per-class
-        let mut class_base_params: [[u64; 5]; 4] = [[0; 5]; 4];
-        let mut class_states: [Option<AutorateState>; 4] = [None; 4];
-
-        if let Some(ref mut autorate) = self.autorate {
-            for class in 0..4u32 {
-                let (total_latency, total_count, total_cycles) = class_metrics[class as usize];
-
-                // Process if we have either latency data OR load data
-                if total_count > 0 || total_cycles > 0 {
-                    // Calculate avg latency if we have samples, otherwise use target as default
-                    let avg_latency_ns = if total_count > 0 {
-                        total_latency / total_count
-                    } else {
-                        0 // Will be replaced with target below
-                    };
-
-                    // Calculate load % - using per-CPU capacity for meaningful values
-                    // load = (total_cycles / nr_cpus) / interval_ns
-                    // This gives average per-CPU utilization (0.0-1.0)
-                    // where 0.0 = 0% load and 1.0 = 100% load (full CPU utilization)
-                    let interval_ns = self.profile.response_ms * 1_000_000;
-
-                    let load_percent = if interval_ns > 0 && self.nr_cpus > 0 {
-                        // Average cycles per CPU
-                        let avg_cycles_per_cpu = total_cycles / (self.nr_cpus as u64);
-
-                        // Compare against interval (single CPU capacity)
-                        // This gives a proper ratio between 0.0 (0% load) and 1.0 (100% load)
-                        let raw_load = (avg_cycles_per_cpu as f64) / (interval_ns as f64);
-
-                        // Clamp to valid percentage range (0% - 100%)
-                        raw_load.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-
-                    let target_latency = self.profile.target_latencies_ns[class as usize];
-
-                    // Use target latency as fallback if no measured latency
-                    let effective_latency_ns = if avg_latency_ns > 0 {
-                        avg_latency_ns
-                    } else {
-                        target_latency
-                    };
-
-                    // Run Autorate
-                    let (base_params, state) =
-                        autorate.update(class, effective_latency_ns, target_latency, load_percent);
-
-                    class_base_params[class as usize] = base_params;
-                    class_states[class as usize] = Some(state);
-                } else {
-                    // No data - use baseline
-                    class_base_params[class as usize] =
-                        self.profile.autorate.baseline_params[class as usize];
-                }
-            }
-        }
-
-        // Reset load accumulators for all classes after reading
-        for class in 0..4u32 {
-            self.reset_load_accumulators(class);
-        }
-
-        // ─────────────────────────────────────────────────────────
-        // STAGE 2: PIE fine-tuning per-(CPU, class)
-        // ─────────────────────────────────────────────────────────
-
-        for cpu in 0..self.nr_cpus {
-            for class in 0..4u32 {
-                let latency = self.read_latency_metrics(cpu as i32, class);
-
-                if latency.sample_count > 0 {
-                    let local_avg_latency_ns = latency.total_latency_ns / latency.sample_count;
-                    let base_params = class_base_params[class as usize];
-
-                    // PIE fine-tunes base_params for this specific CPU
-                    let final_params = self.pie.update_with_base_params(
-                        cpu as u32,
-                        class,
-                        local_avg_latency_ns,
-                        base_params,
-                    );
-
-                    // Write to BPF
-                    self.update_bpf_params(cpu as i32, class, final_params);
-                }
-            }
-        }
-    }
-
-    /// PIE-only update (when --autorate not specified)
-    fn update_pie_only(&mut self) {
+    /// PIE controller update
+    fn update_pie(&mut self) {
         for cpu in 0..self.nr_cpus {
             for class in 0..4u32 {
                 let metrics = self.read_latency_metrics(cpu as i32, class);
@@ -2092,82 +1743,19 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Output Autorate controller debug info
-    fn output_autorate_debug(&self) {
-        let interval_ms = self.opts.debug_autorate.unwrap_or(1000);
-        static mut LAST_OUTPUT: u64 = 0;
+    /// Output parameter bounds debug info
+    fn output_bounds_debug(&mut self) {
+        let interval_ms = self.opts.debug_bounds.unwrap_or(5000);
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
-        unsafe {
-            if now - LAST_OUTPUT < interval_ms {
-                return;
-            }
-            LAST_OUTPUT = now;
+        if self.last_bounds_debug.elapsed() < Duration::from_millis(interval_ms) {
+            return;
         }
+        self.last_bounds_debug = Instant::now();
 
-        eprintln!("\n=== CAKE Autorate State at {:?} ===", Instant::now());
-
-        if let Some(ref autorate) = self.autorate {
-            let stats = autorate.get_stats();
-            eprintln!(
-                "Global: {} classes, {} up, {} down, {} blocked, avg_rate={:.2}",
-                stats.total_classes,
-                stats.adjustments_up,
-                stats.adjustments_down,
-                stats.adjustments_blocked,
-                stats.avg_rate
-            );
-
-            for class in 0..4u32 {
-                if let Some(state) = autorate.get_class_state(class) {
-                    let class_name = match class {
-                        0 => "LATENCY_CRITICAL",
-                        1 => "NORMAL",
-                        2 => "HOG",
-                        3 => "BACKGROUND",
-                        _ => "UNKNOWN",
-                    };
-
-                    eprintln!(
-                        "  Class {} ({}): state={} rate={:.3} load={:.4} ({:.2}%)",
-                        class,
-                        class_name,
-                        state.state.name(),
-                        state.current_rate,
-                        state.load_percent,
-                        state.load_percent * 100.0
-                    );
-                }
-            }
-
-            // Show raw load metrics from BPF for diagnosis
-            eprintln!("\n  Raw load metrics from BPF:");
-            for class in 0..4u32 {
-                let mut total_cycles = 0u64;
-                let mut total_samples = 0u64;
-                for cpu in 0..self.nr_cpus.min(8) {
-                    let load = self.read_load_metrics(cpu as i32, class);
-                    total_cycles += load.cycles_spent;
-                    total_samples += load.sample_count;
-                }
-                let class_name = match class {
-                    0 => "LATENCY_CRITICAL",
-                    1 => "NORMAL",
-                    2 => "HOG",
-                    3 => "BACKGROUND",
-                    _ => "UNKNOWN",
-                };
-                eprintln!(
-                    "    Class {} ({}): cycles={} samples={}",
-                    class, class_name, total_cycles, total_samples
-                );
-            }
-        } else {
-            eprintln!("  Autorate not enabled");
+        // Generate and print the bounds report
+        if let Some(debugger) = self.pie.bound_debugger() {
+            let report = debugger.format_report(self.nr_cpus);
+            eprint!("{}", report);
         }
     }
 }

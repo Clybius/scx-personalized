@@ -18,8 +18,6 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::autorate::AutorateConfig;
-
 /// Class indices matching bpf/intf.h
 #[allow(dead_code)] // Part of public API for future task classification
 pub const DESCENT_CLASS_LATENCY_CRITICAL: usize = 0; // Games, audio, compositors, kthreads
@@ -64,8 +62,6 @@ pub struct Profile {
     /// Target latencies per class (ns)
     /// [LATENCY_CRITICAL, NORMAL, HOG, BACKGROUND]
     pub target_latencies_ns: [u64; 4],
-    /// NEW: CAKE Autorate configuration
-    pub autorate: AutorateConfig,
 }
 
 impl Profile {
@@ -102,13 +98,14 @@ impl Profile {
                     (100, 100),              // preemption_priority
                     (50_000, 500_000),       // migration_cost
                 ],
-                // HOG bounds - wide to prevent PIE getting stuck
+                // HOG bounds - extra wide for encoding/compilation workloads
+                // WIDENED: Previously constrained during heavy load, now matches server flexibility
                 [
-                    (500_000, 2_000_000),    // latency_weight
-                    (1_000_000, 10_000_000), // base_slice_ns (wide for adaptive tuning)
-                    (1024, 2048),            // vruntime_scale
-                    (100, 100),              // preemption_priority
-                    (50_000, 500_000),       // migration_cost
+                    (250_000, 5_000_000),  // latency_weight: widened max from 2M to 5M
+                    (500_000, 20_000_000), // base_slice_ns: widened max from 10M to 20M
+                    (512, 3072),           // vruntime_scale: widened max from 2048 to 3072
+                    (50, 150),             // preemption_priority: allow variation (was fixed 100)
+                    (25_000, 1_000_000),   // migration_cost: widened max from 500K to 1M
                 ],
                 // BACKGROUND bounds
                 [
@@ -126,55 +123,9 @@ impl Profile {
             target_latencies_ns: [
                 500_000,    // LATENCY_CRITICAL: 500 µs (keep tight for audio/games)
                 2_000_000,  // NORMAL: 2 ms
-                10_000_000, // HOG: 10 ms
+                25_000_000, // HOG: 25 ms (increased from 10ms for encoding workloads)
                 50_000_000, // BACKGROUND: 50 ms
             ],
-            autorate: AutorateConfig {
-                enabled: false, // Default: disabled (opt-in via --autorate)
-
-                // Per-class min/baseline/max parameters
-                // Gaming: balanced ranges for stability with autorate
-                min_params: [
-                    // LATENCY_CRITICAL: conservative minimums
-                    [50_000, 300_000, 384, 50, 5_000],
-                    // NORMAL
-                    [100_000, 500_000, 512, 50, 10_000],
-                    // HOG: higher min to reduce CPU hogging impact
-                    [1_000_000, 3_000_000, 1280, 50, 50_000],
-                    // BACKGROUND
-                    [100_000, 500_000, 512, 50, 10_000],
-                ],
-                baseline_params: [
-                    // LATENCY_CRITICAL: standard gaming baseline
-                    [100_000, 600_000, 512, 50, 10_000],
-                    // NORMAL
-                    [1_000_000, 2_000_000, 768, 100, 30_000],
-                    // HOG: constrained baseline
-                    [3_000_000, 5_000_000, 1536, 100, 80_000],
-                    // BACKGROUND
-                    [1_000_000, 2_000_000, 1024, 100, 20_000],
-                ],
-                max_params: [
-                    // LATENCY_CRITICAL: capped for stability
-                    [1_000_000, 1_500_000, 768, 100, 200_000],
-                    // NORMAL - constrained
-                    [3_000_000, 5_000_000, 1024, 100, 300_000],
-                    // HOG - strictly capped to prevent monopolization
-                    [5_000_000, 6_000_000, 1792, 100, 400_000],
-                    // BACKGROUND - constrained
-                    [3_000_000, 4_000_000, 1280, 100, 200_000],
-                ],
-
-                // Balanced gaming tuning (more conservative than before)
-                high_load_threshold: 0.75,
-                low_load_threshold: 0.25,
-                ramp_up_rate: 1.04,   // 4% increase (was 8% - too aggressive)
-                ramp_down_rate: 0.85, // 15% decrease (was 25% - too aggressive)
-                decay_rate: 0.99,     // 1% decay toward baseline (was 2%)
-                adjust_up_refractory_ms: 100, // 100ms between upward adjustments (was 50ms)
-                adjust_down_refractory_ms: 50, // 50ms between downward (was 20ms)
-                bufferbloat_threshold: 1.6, // 1.6x target = bufferbloat (was 1.5x)
-            },
         }
     }
 
@@ -238,42 +189,6 @@ impl Profile {
                 20_000_000,  // HOG: 20 ms
                 100_000_000, // BACKGROUND: 100 ms
             ],
-            autorate: AutorateConfig {
-                enabled: false,
-
-                min_params: [
-                    // More conservative than gaming
-                    [100_000, 400_000, 512, 75, 15_000],
-                    [200_000, 800_000, 640, 75, 20_000],
-                    [750_000, 4_000_000, 1280, 75, 50_000],
-                    [200_000, 800_000, 640, 75, 20_000],
-                ],
-                baseline_params: [
-                    // Standard production baselines
-                    [100_000, 600_000, 512, 100, 30_000],
-                    [500_000, 1_000_000, 768, 100, 30_000],
-                    [2_000_000, 5_000_000, 1536, 100, 50_000],
-                    [1_000_000, 2_000_000, 1024, 100, 20_000],
-                ],
-                max_params: [
-                    // Moderately aggressive - all within bounds
-                    // Bounds: (100K,5M), (200K,5M), (512,1536), (50,150), (5K,1M)
-                    [1_000_000, 4_000_000, 1280, 125, 500_000],
-                    [3_000_000, 4_500_000, 1408, 135, 750_000],
-                    [4_000_000, 4_800_000, 1472, 140, 900_000],
-                    [3_000_000, 4_500_000, 1408, 135, 650_000],
-                ],
-
-                // Balanced tuning
-                high_load_threshold: 0.75,
-                low_load_threshold: 0.30,
-                ramp_up_rate: 1.04,   // 4% increase (moderate)
-                ramp_down_rate: 0.80, // 20% decrease
-                decay_rate: 0.99,     // 1% decay
-                adjust_up_refractory_ms: 75,
-                adjust_down_refractory_ms: 25,
-                bufferbloat_threshold: 1.5,
-            },
         }
     }
 
@@ -337,39 +252,6 @@ impl Profile {
                 50_000_000,  // HOG: 50 ms
                 200_000_000, // BACKGROUND: 200 ms
             ],
-            autorate: AutorateConfig {
-                enabled: false,
-
-                // Narrow ranges for stability
-                min_params: [
-                    [750_000, 1_500_000, 1280, 100, 75_000],
-                    [750_000, 4_000_000, 1280, 100, 75_000],
-                    [750_000, 6_000_000, 1280, 100, 75_000],
-                    [750_000, 4_000_000, 1280, 100, 75_000],
-                ],
-                baseline_params: [
-                    [1_000_000, 2_000_000, 1536, 100, 100_000],
-                    [1_000_000, 5_000_000, 1536, 100, 100_000],
-                    [1_000_000, 8_000_000, 1536, 100, 100_000],
-                    [1_000_000, 5_000_000, 1536, 100, 100_000],
-                ],
-                max_params: [
-                    [2_000_000, 5_000_000, 2048, 100, 200_000],
-                    [2_000_000, 8_000_000, 2048, 100, 200_000],
-                    [2_000_000, 10_000_000, 2048, 100, 200_000],
-                    [2_000_000, 8_000_000, 2048, 100, 200_000],
-                ],
-
-                // Conservative tuning for stability
-                high_load_threshold: 0.80, // Higher threshold
-                low_load_threshold: 0.30,
-                ramp_up_rate: 1.02,           // 2% increase (very conservative)
-                ramp_down_rate: 0.90,         // 10% decrease (gentle)
-                decay_rate: 0.995,            // 0.5% decay (very slow)
-                adjust_up_refractory_ms: 200, // Long refractory
-                adjust_down_refractory_ms: 100,
-                bufferbloat_threshold: 1.8, // Tolerate higher latency
-            },
         }
     }
 }
@@ -484,7 +366,7 @@ mod tests {
             500_000
         );
         assert_eq!(p.target_latencies_ns[DESCENT_CLASS_NORMAL], 2_000_000);
-        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_HOG], 10_000_000);
+        assert_eq!(p.target_latencies_ns[DESCENT_CLASS_HOG], 25_000_000);
         assert_eq!(p.target_latencies_ns[DESCENT_CLASS_BACKGROUND], 50_000_000);
     }
 
@@ -520,7 +402,7 @@ mod tests {
             500_000
         );
         assert_eq!(gaming.get_target_latency(DESCENT_CLASS_NORMAL), 2_000_000);
-        assert_eq!(gaming.get_target_latency(DESCENT_CLASS_HOG), 10_000_000);
+        assert_eq!(gaming.get_target_latency(DESCENT_CLASS_HOG), 25_000_000);
         assert_eq!(
             gaming.get_target_latency(DESCENT_CLASS_BACKGROUND),
             50_000_000
@@ -621,63 +503,5 @@ mod tests {
         assert!(s.contains("20ms")); // Balanced response (was 10ms - too aggressive)
         assert!(s.contains("α=8")); // Balanced proportional gain (was 4 - too aggressive)
         assert!(s.contains("β=4")); // Balanced integral response (was 2 - too aggressive)
-    }
-
-    #[test]
-    fn test_gaming_autorate_config() {
-        let p = Profile::gaming();
-        assert!(!p.autorate.enabled); // Disabled by default
-        assert!((p.autorate.ramp_up_rate - 1.04).abs() < f64::EPSILON); // 4% aggressive (conservative tuning)
-        assert!((p.autorate.ramp_down_rate - 0.85).abs() < f64::EPSILON); // 15% decrease
-    }
-
-    #[test]
-    fn test_production_autorate_config() {
-        let p = Profile::production();
-        assert!(!p.autorate.enabled);
-        assert!((p.autorate.ramp_up_rate - 1.04).abs() < f64::EPSILON); // 4% moderate
-    }
-
-    #[test]
-    fn test_server_autorate_config() {
-        let p = Profile::server();
-        assert!(!p.autorate.enabled);
-        assert!((p.autorate.ramp_up_rate - 1.02).abs() < f64::EPSILON); // 2% conservative
-    }
-
-    #[test]
-    fn test_autorate_params_in_bounds() {
-        // Verify all autorate params fall within profile bounds
-        // Note: Gaming and Production profiles have some autorate params outside bounds (known issue)
-        // Only testing server which has consistent bounds
-        let p = Profile::server();
-        for class in 0..DESCENT_CLASS_MAX {
-            for param in 0..PARAM_COUNT {
-                let (min_bound, max_bound) = p.bounds[class][param];
-
-                assert!(
-                    p.autorate.min_params[class][param] >= min_bound,
-                    "min_params out of bounds: profile={}, class={}, param={}",
-                    p.name,
-                    class,
-                    param
-                );
-                assert!(
-                    p.autorate.max_params[class][param] <= max_bound,
-                    "max_params out of bounds: profile={}, class={}, param={}",
-                    p.name,
-                    class,
-                    param
-                );
-                assert!(
-                    p.autorate.baseline_params[class][param] >= min_bound
-                        && p.autorate.baseline_params[class][param] <= max_bound,
-                    "baseline_params out of bounds: profile={}, class={}, param={}",
-                    p.name,
-                    class,
-                    param
-                );
-            }
-        }
     }
 }

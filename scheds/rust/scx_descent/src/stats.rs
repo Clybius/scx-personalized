@@ -44,20 +44,13 @@ pub struct Metrics {
     pub pie_integral: i64,
     #[stat(desc = "PIE controller latency error (µs)")]
     pub pie_latency_error_us: i64,
-    // NEW: Autorate metrics
-    #[stat(desc = "CAKE Autorate enabled (0/1)")]
-    pub autorate_enabled: u64,
-    #[stat(desc = "Autorate state (0=steady,1=load_high,2=load_low,3=bufferbloat)")]
-    pub autorate_state: u64,
-    #[stat(desc = "Autorate adaptation rate (0-100, 50=baseline)")]
-    pub autorate_rate_percent: u64,
 }
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | pie: updates={} lat={}µs err={}µs | classes: lc:{} n:{} h:{} bg:{} | autorate: en:{} st:{} rt:{}%",
+            "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | pie: updates={} lat={}µs err={}µs | classes: lc:{} n:{} h:{} bg:{}",
             crate::SCHEDULER_NAME,
             self.nr_running,
             self.nr_cpus,
@@ -71,9 +64,6 @@ impl Metrics {
             self.nr_tasks_normal,
             self.nr_tasks_hog,
             self.nr_tasks_background,
-            self.autorate_enabled,
-            self.autorate_state,
-            self.autorate_rate_percent
         )?;
         Ok(())
     }
@@ -94,10 +84,6 @@ impl Metrics {
             nr_tasks_background: self.nr_tasks_background,
             nr_running: self.nr_running,
             nr_cpus: self.nr_cpus,
-            // Autorate metrics - not delta
-            autorate_enabled: self.autorate_enabled,
-            autorate_state: self.autorate_state,
-            autorate_rate_percent: self.autorate_rate_percent,
         }
     }
 }
