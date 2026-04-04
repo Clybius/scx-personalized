@@ -1912,8 +1912,9 @@ void BPF_STRUCT_OPS(descent_enable, struct task_struct *p)
 	/* Initialize task classification */
 	tctx = try_lookup_task_ctx(p);
 	if (tctx) {
-		tctx->task_class       = classify_task(p, tctx);
-		tctx->class_entry_time = bpf_ktime_get_ns();
+		tctx->task_class	= classify_task(p, tctx);
+		tctx->class_entry_time	= bpf_ktime_get_ns();
+		tctx->last_run_start_ns = 0; /* Reset for load tracking */
 	}
 }
 
@@ -2001,6 +2002,10 @@ s32 BPF_STRUCT_OPS(descent_init_task, struct task_struct *p,
 	tctx->class_entry_time	 = bpf_ktime_get_ns();
 	tctx->reclassify_counter = 0;
 	tctx->runtime_ns	 = 0;
+
+	/* Initialize timing fields for PIE latency and load tracking */
+	tctx->enqueue_time_ns	= 0;
+	tctx->last_run_start_ns = 0;
 
 	/* Cache kthread flag from task flags (PF_KTHREAD is bit 21) */
 	u8 is_kthread = ((u32)(p->flags >> 21) & 1u);

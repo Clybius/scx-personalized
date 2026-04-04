@@ -300,8 +300,7 @@ pub struct AutorateController {
 impl AutorateController {
     /// Create new controller
     ///
-    /// # Arguments
-    /// * `nr_cpus` - Number of CPUs (used for initial load estimate, but states are per-class)
+    /// * `_nr_cpus` - Number of CPUs (used for initial load estimate, but states are per-class)
     /// * `config` - Autorate configuration
     pub fn new(_nr_cpus: usize, config: &AutorateConfig) -> Self {
         let mut states = HashMap::new();
@@ -358,12 +357,32 @@ impl AutorateController {
         // First, compute the new state (only needs immutable borrow of self)
         let new_state = self.determine_state(latency_ns, target_latency_ns, load_percent);
 
+        // CRITICAL FIX: Check cross-class protection BEFORE getting mutable state
+        // If LATENCY_CRITICAL is in BUFFERBLOAT, cap HOG (Class 2) rate at baseline
+        let effective_max_rate = if class == 2 {
+            // Check if LATENCY_CRITICAL (Class 0) is under pressure
+            if let Some(lc_state) = self.states.get(&0) {
+                if lc_state.state == AutorateState::Bufferbloat {
+                    0.5 // Cap at baseline to protect audio/latency tasks
+                } else {
+                    1.0 // Normal max rate
+                }
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+
         // ALWAYS update the state with current metrics (for monitoring/display)
         // even if autorate interpolation is disabled
         let state = self
             .states
             .entry(class)
             .or_insert_with(AutorateClassState::new);
+
+        // CRITICAL FIX: Capture prev_state BEFORE updating state.state
+        let prev_state = state.state;
 
         // Update metrics
         state.prev_latency_ns = state.latency_ewma_ns;
@@ -385,8 +404,6 @@ impl AutorateController {
         let decay_rate = self.config.decay_rate;
         let adjust_up_refractory_ms = self.config.adjust_up_refractory_ms;
         let adjust_down_refractory_ms = self.config.adjust_down_refractory_ms;
-
-        let prev_state = state.state;
 
         // Check refractory period if state change requires adjustment
         let requires_adjustment = new_state != AutorateState::Steady || prev_state != new_state;
@@ -439,7 +456,10 @@ impl AutorateController {
             // Calculate new rate inline to avoid borrow issues
             let new_rate = match new_state {
                 AutorateState::Bufferbloat => current_rate * ramp_down_rate,
-                AutorateState::LoadHigh => (current_rate * ramp_up_rate).min(1.0),
+                AutorateState::LoadHigh => {
+                    // Apply effective max rate (may be capped for HOG when LATENCY_CRITICAL under pressure)
+                    (current_rate * ramp_up_rate).min(effective_max_rate)
+                }
                 AutorateState::LoadLow => {
                     if current_rate > 0.5 {
                         current_rate * decay_rate

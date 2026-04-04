@@ -1635,8 +1635,8 @@ impl<'a> Scheduler<'a> {
 
                     // Calculate load % - using per-CPU capacity for meaningful values
                     // load = (total_cycles / nr_cpus) / interval_ns
-                    // This gives average per-CPU utilization (0.0-1.0+)
-                    // For small values, we scale up by 100x to get meaningful state transitions
+                    // This gives average per-CPU utilization (0.0-1.0)
+                    // where 0.0 = 0% load and 1.0 = 100% load (full CPU utilization)
                     let interval_ns = self.profile.response_ms * 1_000_000;
 
                     let load_percent = if interval_ns > 0 && self.nr_cpus > 0 {
@@ -1644,10 +1644,10 @@ impl<'a> Scheduler<'a> {
                         let avg_cycles_per_cpu = total_cycles / (self.nr_cpus as u64);
 
                         // Compare against interval (single CPU capacity)
-                        // Scale by 100 to get values that can trigger state changes
-                        let raw_load = (avg_cycles_per_cpu as f64) / (interval_ns as f64) * 100.0;
+                        // This gives a proper ratio between 0.0 (0% load) and 1.0 (100% load)
+                        let raw_load = (avg_cycles_per_cpu as f64) / (interval_ns as f64);
 
-                        // Cap at 1.0 (100% of one CPU after scaling)
+                        // Clamp to valid percentage range (0% - 100%)
                         raw_load.clamp(0.0, 1.0)
                     } else {
                         0.0
