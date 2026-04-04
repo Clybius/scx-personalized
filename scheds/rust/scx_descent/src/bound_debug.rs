@@ -70,15 +70,6 @@ impl BoundStats {
     pub fn is_constrained(&self) -> bool {
         self.total_bound_hit_percent() > 80.0
     }
-
-    /// Get the average latency error when at bounds
-    pub fn avg_latency_error_at_bounds(&self) -> i64 {
-        let total_bound_hits = self.min_hits + self.max_hits;
-        if total_bound_hits == 0 {
-            return 0;
-        }
-        (self.latency_error_at_min + self.latency_error_at_max) / total_bound_hits as i64
-    }
 }
 
 /// Parameter names for human-readable output
@@ -128,11 +119,6 @@ impl BoundDebugger {
     /// Enable or disable debugging at runtime
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
-    }
-
-    /// Set the constraint threshold percentage
-    pub fn set_constraint_threshold(&mut self, threshold: f64) {
-        self.constraint_threshold = threshold;
     }
 
     /// Record a parameter update event (even if not clamped)
@@ -214,34 +200,6 @@ impl BoundDebugger {
         self.stats.get(&key)
     }
 
-    /// Get mutable statistics for a specific (cpu, class, param)
-    fn get_stats_mut(&mut self, cpu: u32, class: u32, param_idx: usize) -> &mut BoundStats {
-        let key = BoundKey {
-            cpu,
-            class,
-            param_idx,
-        };
-        self.stats.entry(key).or_insert_with(BoundStats::default)
-    }
-
-    /// Get all stats for a specific class across all CPUs and params
-    pub fn get_class_stats(&self, class: u32) -> Vec<(BoundKey, &BoundStats)> {
-        self.stats
-            .iter()
-            .filter(|(key, _)| key.class == class)
-            .map(|(key, stats)| (*key, stats))
-            .collect()
-    }
-
-    /// Get all stats for a specific parameter across all CPUs and classes
-    pub fn get_param_stats(&self, param_idx: usize) -> Vec<(BoundKey, &BoundStats)> {
-        self.stats
-            .iter()
-            .filter(|(key, _)| key.param_idx == param_idx)
-            .map(|(key, stats)| (*key, stats))
-            .collect()
-    }
-
     /// Get all constrained parameters (hitting bounds > threshold %)
     pub fn get_constrained_params(&self) -> Vec<(BoundKey, &BoundStats, BoundType)> {
         let mut constrained = Vec::new();
@@ -282,16 +240,11 @@ impl BoundDebugger {
         let mut total_updates = 0u64;
         let mut total_min_hits = 0u64;
         let mut total_max_hits = 0u64;
-        let mut constrained_count = 0usize;
 
         for (_, stats) in &self.stats {
             total_updates += stats.total_updates;
             total_min_hits += stats.min_hits;
             total_max_hits += stats.max_hits;
-
-            if stats.is_constrained() {
-                constrained_count += 1;
-            }
         }
 
         let total_bound_hits = total_min_hits + total_max_hits;
@@ -302,8 +255,6 @@ impl BoundDebugger {
         };
 
         BoundSummary {
-            total_tracked_params: self.stats.len(),
-            constrained_params: constrained_count,
             total_updates,
             total_min_hits,
             total_max_hits,
@@ -444,20 +395,11 @@ impl BoundDebugger {
 
         report
     }
-
-    /// Reset all statistics
-    pub fn reset(&mut self) {
-        self.stats.clear();
-    }
 }
 
 /// Global summary of bound statistics
 #[derive(Debug, Clone, Copy)]
 pub struct BoundSummary {
-    /// Total number of tracked parameters
-    pub total_tracked_params: usize,
-    /// Number of parameters considered constrained
-    pub constrained_params: usize,
     /// Total number of updates across all parameters
     pub total_updates: u64,
     /// Total hits at minimum bound
@@ -604,7 +546,6 @@ mod tests {
         }
 
         let summary = debugger.get_summary();
-        assert_eq!(summary.total_tracked_params, 2);
         assert_eq!(summary.total_min_hits, 5);
         assert_eq!(summary.total_max_hits, 5);
         assert!(summary.overall_constraint_percentage > 0.0);
