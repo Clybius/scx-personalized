@@ -179,7 +179,7 @@ struct Opts {
     throttle_us: u64,
 
     /// Set CPU idle QoS resume latency in microseconds (-1 = disabled).
-    #[clap(short = 'I', long, allow_hyphen_values = true, default_value = "32")]
+    #[clap(short = 'I', long, allow_hyphen_values = true, default_value = "-1")]
     idle_resume_us: i64,
 
     /// Enable tickless mode.
