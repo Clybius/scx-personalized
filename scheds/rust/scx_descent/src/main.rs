@@ -850,6 +850,99 @@ impl<'a> Scheduler<'a> {
         None
     }
 
+    /// Detect Desktop Environment component TGIDs by scanning comm names
+    ///
+    /// DE components are promoted to LATENCY_CRITICAL during non-GAMING states
+    /// to ensure desktop responsiveness (UI, panel, notifications, etc.)
+    fn detect_de_components(&self) -> Vec<u32> {
+        let mut de_tgids = HashSet::new();
+
+        const DE_COMMS: &[&str] = &[
+            // GNOME
+            "gnome-shell",
+            "gnome-panel",
+            // KDE Plasma
+            "plasmashell",
+            "kwin_wayland",
+            "kwin_x11",
+            "plasma-desktop",
+            // Sway
+            "sway",
+            "swaybar",
+            // Hyprland
+            "Hyprland",
+            // XFCE
+            "xfce4-panel",
+            "xfwm4",
+            "xfdesktop",
+            // LXQt
+            "lxqt-panel",
+            "pcmanfm-qt",
+            // MATE
+            "marco",
+            "mate-panel",
+            // Cinnamon
+            "cinnamon",
+            "muffin",
+            // i3/sway family
+            "i3",
+            "i3bar",
+            // Wayfire
+            "wayfire",
+            // Weston
+            "weston",
+            // Gamescope (Steam Deck UI)
+            "gamescope",
+            // Budgie
+            "budgie-panel",
+            "budgie-wm",
+            // Deepin
+            "dde-desktop",
+            "dde-panel",
+            // Pantheon (elementary)
+            "gala",
+            "wingpanel",
+            // Common file managers (for desktop icons)
+            "nautilus", // GNOME Files
+            "dolphin",  // KDE Files
+            "thunar",   // XFCE Files
+            "pcmanfm",  // LXDE/LXQt Files
+            "caja",     // MATE Files
+            "nemo",     // Cinnamon Files
+        ];
+
+        // Scan /proc for matching comm names
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name();
+                let pid_str = file_name.to_string_lossy();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", pid)) {
+                        let comm = comm.trim();
+                        if DE_COMMS.iter().any(|&de| comm == de) {
+                            // Get TGID from status
+                            if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid))
+                            {
+                                for line in status.lines() {
+                                    if line.starts_with("Tgid:") {
+                                        if let Some(tgid_str) = line.split_whitespace().nth(1) {
+                                            if let Ok(tgid) = tgid_str.parse::<u32>() {
+                                                de_tgids.insert(tgid);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        de_tgids.into_iter().collect()
+    }
+
     /// Detect game process via Steam envvar or Wine exe
     fn detect_game_process(&self) -> Option<(u32, u32, u8)> {
         // Scan /proc for game indicators
@@ -994,6 +1087,27 @@ impl<'a> Scheduler<'a> {
             // Clear remaining slots
             for i in nr_turbo..16 {
                 bss_data.turbo_tgids[i] = 0;
+            }
+        }
+    }
+
+    /// Update BPF Desktop Environment component tracking
+    ///
+    /// Writes the list of DE TGIDs to the BPF BSS section, enabling
+    /// the BPF scheduler to identify and prioritize DE tasks during non-GAMING states.
+    fn update_bpf_de_tgids(&mut self, de_tgids: &[u32]) {
+        if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
+            let nr_de = de_tgids.len().min(16);
+            bss_data.nr_de_tgids = nr_de as u32;
+            bss_data.de_detected = if nr_de > 0 { 1 } else { 0 };
+
+            for (i, &tgid) in de_tgids.iter().take(16).enumerate() {
+                bss_data.de_tgids[i] = tgid;
+            }
+
+            // Clear remaining slots
+            for i in nr_de..16 {
+                bss_data.de_tgids[i] = 0;
             }
         }
     }
@@ -1283,6 +1397,17 @@ impl<'a> Scheduler<'a> {
         );
         self.update_bpf_audio_tgids(&current_audio_tgids);
 
+        // Initial DE detection
+        let de_tgids = self.detect_de_components();
+        if !de_tgids.is_empty() {
+            info!(
+                "Detected {} DE component(s): {:?}",
+                de_tgids.len(),
+                de_tgids
+            );
+        }
+        self.update_bpf_de_tgids(&de_tgids);
+
         // Initial parameter sync: write default PIE params to BPF
         let nr_cpus = self.nr_cpus;
         for cpu in 0..nr_cpus {
@@ -1306,6 +1431,17 @@ impl<'a> Scheduler<'a> {
                 // Re-detect audio daemons periodically
                 current_audio_tgids = self.detect_audio_daemons();
                 self.update_bpf_audio_tgids(&current_audio_tgids);
+
+                // Detect DE components
+                let de_tgids = self.detect_de_components();
+                if !de_tgids.is_empty() {
+                    debug!(
+                        "Detected {} DE component(s): {:?}",
+                        de_tgids.len(),
+                        de_tgids
+                    );
+                }
+                self.update_bpf_de_tgids(&de_tgids);
 
                 // Detect turbo processes
                 let turbo_tgids = self.detect_turbo_processes();

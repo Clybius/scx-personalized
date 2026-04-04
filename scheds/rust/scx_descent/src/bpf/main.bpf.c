@@ -155,8 +155,16 @@ volatile u32 nr_audio_tgids; // Number of valid audio TGIDs
  * Turbo process tracking - processes with SCX_DESCENT_TURBO env var get
  * highest priority scheduling
  */
-volatile u32	 turbo_tgids[16]; // Turbo process TGIDs (array)
-volatile u32	 nr_turbo_tgids; // Number of valid turbo TGIDs
+volatile u32 turbo_tgids[16]; // Turbo process TGIDs (array)
+volatile u32 nr_turbo_tgids; // Number of valid turbo TGIDs
+
+/*
+ * Desktop Environment process tracking - compositors and shell processes get
+ * elevated priority for responsive UI
+ */
+volatile u32	 de_tgids[16]; // Desktop Environment process TGIDs (array)
+volatile u32	 nr_de_tgids; // Number of valid DE TGIDs
+volatile u8	 de_detected; // Flag indicating if DE is currently active
 
 static inline u8 is_throttled(void)
 {
@@ -822,6 +830,24 @@ static u32 classify_task(struct task_struct *p, struct task_ctx *tctx)
 	if (p->policy == SCHED_IDLE) {
 		class = DESCENT_CLASS_BACKGROUND;
 		goto done;
+	}
+
+	/*
+	 * Check for Desktop Environment components (outside GAMING state only)
+	 * DE components need responsiveness for UI interactions during desktop use
+	 */
+	if (sched_state != 2 && nr_de_tgids > 0) { // Not in GAMING state
+		u32 task_tgid = p->tgid;
+
+#pragma unroll
+		for (u32 i = 0; i < 16; i++) {
+			if (i >= nr_de_tgids)
+				break;
+			if (task_tgid == de_tgids[i]) {
+				class = DESCENT_CLASS_LATENCY_CRITICAL;
+				goto done;
+			}
+		}
 	}
 
 	/* Only during GAMING state: full classification */
