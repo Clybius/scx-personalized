@@ -6,6 +6,7 @@
  * Phase 1: Basic structure with classification and per-class parameters
  */
 #include <scx/common.bpf.h>
+#include <bpf_experimental.h>
 #include "intf.h"
 #include "descent.bpf.h"
 
@@ -29,6 +30,15 @@
  * Turbo tasks get highest priority scheduling
  */
 #define BIT_TURBO 22 /* Task is a turbo-boosted process */
+
+/*
+ * Task flags for input detection and prioritization
+ * These are cached in task_ctx->packed field (bits 18-21)
+ */
+#define BIT_INPUT_KWORKER 18 /* Task is an input-related kworker */
+#define BIT_KSOFTIRQD 19 /* Task is a ksoftirqd thread */
+#define BIT_WOKEN_BY_HARDIRQ 20 /* Task woken by hardware interrupt */
+#define BIT_WOKEN_BY_SOFTIRQ 21 /* Task woken by softirq */
 
 /*
  * Task classification thresholds
@@ -162,9 +172,23 @@ volatile u32 nr_turbo_tgids; // Number of valid turbo TGIDs
  * Desktop Environment process tracking - compositors and shell processes get
  * elevated priority for responsive UI
  */
-volatile u32	 de_tgids[16]; // Desktop Environment process TGIDs (array)
-volatile u32	 nr_de_tgids; // Number of valid DE TGIDs
-volatile u8	 de_detected; // Flag indicating if DE is currently active
+volatile u32 de_tgids[16]; // Desktop Environment process TGIDs (array)
+volatile u32 nr_de_tgids; // Number of valid DE TGIDs
+volatile u8  de_detected; // Flag indicating if DE is currently active
+
+/*
+ * Input-related kworker tracking - written by userspace, read by BPF
+ * These are TGIDs of kernel worker threads handling input devices
+ */
+volatile u32 input_kworker_tgids[16]; // Input kworker TGIDs
+volatile u32 nr_input_kworker_tgids; // Number of valid input kworker TGIDs
+
+/*
+ * ksoftirqd tracking - written by userspace, read by BPF
+ * ksoftirqd threads get priority boost for deferred interrupt handling
+ */
+volatile u32	 ksoftirqd_tgids[16]; // ksoftirqd TGIDs (detected by userspace)
+volatile u32	 nr_ksoftirqd_tgids; // Number of valid ksoftirqd TGIDs
 
 static inline u8 is_throttled(void)
 {
@@ -613,6 +637,12 @@ struct task_ctx {
 	 * PPID for Wine/Proton family detection.
 	 */
 	u32 ppid;
+
+	/*
+	 * Input-specific tracking (NEW)
+	 */
+	u64 last_input_wakeup_ns; /* Last time woken by input interrupt */
+	u32 input_wakeup_count; /* Count of input wakeups (for heuristics) */
 };
 
 /* Map that contains task-local storage. */
@@ -757,21 +787,32 @@ static inline u64 task_slice(const struct task_struct *p, struct task_ctx *tctx)
 static inline s32 smt_sibling(s32 cpu);
 
 /*
- * Check if a task's TGID is in the turbo list.
+ * Check if task is a ksoftirqd thread
  */
-static inline u8 is_turbo_tgid(u32 task_tgid)
+static inline bool is_ksoftirqd(struct task_struct *p)
 {
-	if (nr_turbo_tgids == 0)
-		return 0;
+	/* Check if task name starts with "ksoftirqd/" */
+	return (p->comm[0] == 'k' && p->comm[1] == 's' && p->comm[2] == 'o' &&
+		p->comm[3] == 'f' && p->comm[4] == 't' && p->comm[5] == 'i' &&
+		p->comm[6] == 'r' && p->comm[7] == 'q' && p->comm[8] == 'd' &&
+		p->comm[9] == '/');
+}
+
+/*
+ * Check TGID against turbo list
+ */
+static inline bool is_turbo_tgid(u32 tgid)
+{
+	u32 i;
 
 #pragma unroll
-	for (u32 i = 0; i < 16; i++) {
+	for (i = 0; i < 16; i++) {
 		if (i >= nr_turbo_tgids)
 			break;
-		if (task_tgid == turbo_tgids[i])
-			return 1;
+		if (tgid == turbo_tgids[i])
+			return true;
 	}
-	return 0;
+	return false;
 }
 
 /*
@@ -809,7 +850,13 @@ static inline u8 is_sibling_turbo_task(s32 cpu)
  */
 static u32 classify_task(struct task_struct *p, struct task_ctx *tctx)
 {
-	u32 class = DESCENT_CLASS_NORMAL; /* Default */
+	u32 class		= DESCENT_CLASS_NORMAL; /* Default */
+	u8  is_kthread_cached	= (tctx->packed >> BIT_KTHREAD) & 1;
+	u8  woken_by_hardirq	= (tctx->packed >> BIT_WOKEN_BY_HARDIRQ) & 1;
+	u8  woken_by_softirq	= (tctx->packed >> BIT_WOKEN_BY_SOFTIRQ) & 1;
+	u8  is_ksoftirqd_cached = (tctx->packed >> BIT_KSOFTIRQD) & 1;
+	u8  is_input_kworker_cached = (tctx->packed >> BIT_INPUT_KWORKER) & 1;
+	u32 task_tgid		    = p->tgid;
 
 	/* Increment counter, skip expensive classification on 63/64 stops */
 	tctx->reclassify_counter++;
@@ -833,12 +880,80 @@ static u32 classify_task(struct task_struct *p, struct task_ctx *tctx)
 	}
 
 	/*
+	 * INPUT EVENT PRIORITY (NEW)
+	 *
+	 * Tasks woken by hardware interrupts get highest priority.
+	 * This covers input events (mouse, keyboard, touch), disk I/O,
+	 * GPU V-Sync, and other latency-critical hardware signals.
+	 */
+	if (woken_by_hardirq) {
+		class = DESCENT_CLASS_LATENCY_CRITICAL;
+		/* Clear the flag after using it (one-shot boost) */
+		tctx->packed &= ~(1 << BIT_WOKEN_BY_HARDIRQ);
+		goto done;
+	}
+
+	/*
+	 * ksoftirqd threads handle deferred interrupt work.
+	 * They should get high priority during all states.
+	 */
+	if (is_ksoftirqd_cached) {
+		class = DESCENT_CLASS_LATENCY_CRITICAL;
+		goto done;
+	}
+
+	/*
+	 * SoftIRQ-woken tasks also get priority (though less than hardirq).
+	 * Clear the flag after using it.
+	 */
+	if (woken_by_softirq) {
+		class = DESCENT_CLASS_LATENCY_CRITICAL;
+		tctx->packed &= ~(1 << BIT_WOKEN_BY_SOFTIRQ);
+		goto done;
+	}
+
+	/*
+	 * Input-related kworkers (identified by userspace scanning).
+	 * These handle input device events at the kernel level.
+	 */
+	if (is_input_kworker_cached) {
+		class = DESCENT_CLASS_LATENCY_CRITICAL;
+		goto done;
+	}
+
+	/* Check TGID against userspace-provided input kworker list */
+	if (nr_input_kworker_tgids > 0) {
+#pragma unroll
+		for (u32 i = 0; i < 16; i++) {
+			if (i >= nr_input_kworker_tgids)
+				break;
+			if (task_tgid == input_kworker_tgids[i]) {
+				class = DESCENT_CLASS_LATENCY_CRITICAL;
+				tctx->packed |= (1 << BIT_INPUT_KWORKER);
+				goto done;
+			}
+		}
+	}
+
+	/* Check TGID against userspace-provided ksoftirqd list */
+	if (nr_ksoftirqd_tgids > 0) {
+#pragma unroll
+		for (u32 i = 0; i < 16; i++) {
+			if (i >= nr_ksoftirqd_tgids)
+				break;
+			if (task_tgid == ksoftirqd_tgids[i]) {
+				class = DESCENT_CLASS_LATENCY_CRITICAL;
+				tctx->packed |= (1 << BIT_KSOFTIRQD);
+				goto done;
+			}
+		}
+	}
+
+	/*
 	 * Check for Desktop Environment components (outside GAMING state only)
 	 * DE components need responsiveness for UI interactions during desktop use
 	 */
 	if (sched_state != 2 && nr_de_tgids > 0) { // Not in GAMING state
-		u32 task_tgid = p->tgid;
-
 #pragma unroll
 		for (u32 i = 0; i < 16; i++) {
 			if (i >= nr_de_tgids)
@@ -852,8 +967,6 @@ static u32 classify_task(struct task_struct *p, struct task_ctx *tctx)
 
 	/* Only during GAMING state: full classification */
 	if (sched_state == 2) { /* GAMING */
-		u8 is_kthread_cached = (tctx->packed >> BIT_KTHREAD) & 1;
-
 		/* Class 0: LATENCY_CRITICAL */
 		/* Game family matching */
 		u8 is_game_family =
@@ -1232,8 +1345,42 @@ s32 BPF_STRUCT_OPS(descent_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	/* Update task classification using momentum-based method */
 	tctx = try_lookup_task_ctx(p);
-	if (tctx)
+	if (tctx) {
 		update_classification_momentum(p, tctx);
+
+		/*
+		 * Input Event Detection (Phase 1)
+		 *
+		 * Check if task is woken by interrupt handler (hardirq or softirq).
+		 * This indicates the task is handling an input event (keyboard, mouse,
+		 * touch) or other latency-critical hardware signal.
+		 *
+		 * WARNING: bpf_in_nmi/task/hardirq/serving_softirq() is supported only
+		 * in x86_64 and arm64. On unsupported architectures, these return 0.
+		 */
+		if (unlikely(bpf_in_hardirq() || bpf_in_nmi())) {
+			/* Task woken by hardware interrupt - likely input event */
+			tctx->packed |= (1 << BIT_WOKEN_BY_HARDIRQ);
+			tctx->packed &= ~(1 << BIT_WOKEN_BY_SOFTIRQ);
+			tctx->last_input_wakeup_ns = bpf_ktime_get_ns();
+			tctx->input_wakeup_count++;
+
+			dbg_msg("Input: Task %d woken by hardirq", p->pid);
+		} else if (unlikely(bpf_in_serving_softirq())) {
+			/* Task woken by softirq - deferred interrupt processing */
+			tctx->packed |= (1 << BIT_WOKEN_BY_SOFTIRQ);
+			tctx->packed &= ~(1 << BIT_WOKEN_BY_HARDIRQ);
+
+			dbg_msg("Input: Task %d woken by softirq", p->pid);
+		}
+
+		/* Check if waker is ksoftirqd */
+		struct task_struct *waker = bpf_get_current_task_btf();
+		if (waker && is_ksoftirqd(waker)) {
+			tctx->packed |= (1 << BIT_WOKEN_BY_SOFTIRQ);
+			tctx->packed &= ~(1 << BIT_WOKEN_BY_HARDIRQ);
+		}
+	}
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
 
@@ -1812,8 +1959,10 @@ void BPF_STRUCT_OPS(descent_stopping, struct task_struct *p, bool runnable)
 
 		/*
 		 * Also call classify_task for the scx_cake-style classification
-		 * (runs the 64-counter based classification)
+		 * Cache input-related flags before classification
 		 */
+		tctx->packed |= (tctx->packed & (1 << BIT_WOKEN_BY_HARDIRQ));
+		tctx->packed |= (tctx->packed & (1 << BIT_WOKEN_BY_SOFTIRQ));
 		classify_task(p, tctx);
 
 		/*
@@ -2010,6 +2159,14 @@ s32 BPF_STRUCT_OPS(descent_init_task, struct task_struct *p,
 	/* Cache kthread flag from task flags (PF_KTHREAD is bit 21) */
 	u8 is_kthread = ((u32)(p->flags >> 21) & 1u);
 	tctx->packed  = (is_kthread << BIT_KTHREAD);
+
+	/*
+	 * NEW: Detect ksoftirqd threads at initialization
+	 */
+	if (is_ksoftirqd(p)) {
+		tctx->packed |= (1 << BIT_KSOFTIRQD);
+		dbg_msg("Input: Detected ksoftirqd thread %d", p->pid);
+	}
 
 	/* Initialize PPID from parent */
 	tctx->ppid = 0;

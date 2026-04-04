@@ -1025,6 +1025,114 @@ impl<'a> Scheduler<'a> {
         audio_tgids.into_iter().collect()
     }
 
+    /// Detect input-related kworker threads by scanning /proc
+    ///
+    /// Input kworkers are kernel worker threads that handle input device events.
+    /// They typically have names like "kworker/0:1-events" or similar.
+    fn detect_input_kworkers(&self) -> Vec<u32> {
+        let mut input_tgids = HashSet::new();
+
+        // Input-related patterns in kernel thread names
+        const INPUT_PATTERNS: &[&str] = &[
+            // ksoftirqd threads - handle deferred interrupts including input
+            "ksoftirqd/",
+            // HID (Human Interface Device) workers
+            "hid-",
+            // USB input workers
+            "usbhid",
+            // Input event handlers
+            "input_",
+            // IRQ workers for input devices
+            "irq/",
+        ];
+
+        // Scan /proc for kernel threads
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name();
+                let pid_str = file_name.to_string_lossy();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    // Check if this is a kernel thread (parent is kthreadd, PID 2)
+                    if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
+                        let mut ppid: Option<u32> = None;
+                        let mut tgid: Option<u32> = None;
+
+                        for line in status.lines() {
+                            if line.starts_with("PPid:") {
+                                ppid = line.split_whitespace().nth(1).and_then(|s| s.parse().ok());
+                            }
+                            if line.starts_with("Tgid:") {
+                                tgid = line.split_whitespace().nth(1).and_then(|s| s.parse().ok());
+                            }
+                        }
+
+                        // Check if parent is kthreadd (PID 2) - this is a kernel thread
+                        if ppid == Some(2) {
+                            if let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", pid)) {
+                                let comm = comm.trim();
+
+                                // Check for input-related patterns
+                                if INPUT_PATTERNS
+                                    .iter()
+                                    .any(|&pattern| comm.starts_with(pattern))
+                                {
+                                    if let Some(tgid) = tgid {
+                                        input_tgids.insert(tgid);
+                                        debug!("Detected input kworker: {} (TGID: {})", comm, tgid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        input_tgids.into_iter().collect()
+    }
+
+    /// Detect ksoftirqd threads (handle deferred interrupts)
+    ///
+    /// ksoftirqd threads are critical for input latency as they handle
+    /// the bottom half of interrupt processing for input devices.
+    fn detect_ksoftirqd_threads(&self) -> Vec<u32> {
+        let mut ksoftirqd_tgids = HashSet::new();
+
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name();
+                let pid_str = file_name.to_string_lossy();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", pid)) {
+                        let comm = comm.trim();
+                        if comm.starts_with("ksoftirqd/") {
+                            // Get TGID
+                            if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid))
+                            {
+                                for line in status.lines() {
+                                    if line.starts_with("Tgid:") {
+                                        if let Some(tgid_str) = line.split_whitespace().nth(1) {
+                                            if let Ok(tgid) = tgid_str.parse::<u32>() {
+                                                ksoftirqd_tgids.insert(tgid);
+                                                debug!(
+                                                    "Detected ksoftirqd: {} (TGID: {})",
+                                                    comm, tgid
+                                                );
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        ksoftirqd_tgids.into_iter().collect()
+    }
+
     /// Detect processes with SCX_DESCENT_TURBO=1 environment variable
     ///
     /// Scans /proc for processes with the SCX_DESCENT_TURBO environment variable
@@ -1350,6 +1458,57 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Update BPF input kworker tracking
+    ///
+    /// Writes the list of input kworker TGIDs to the BPF BSS section,
+    /// enabling the BPF scheduler to identify and prioritize input tasks.
+    fn update_bpf_input_kworkers(&mut self, input_tgids: &[u32]) {
+        if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
+            let nr_input = input_tgids.len().min(16);
+            bss_data.nr_input_kworker_tgids = nr_input as u32;
+
+            for (i, &tgid) in input_tgids.iter().take(16).enumerate() {
+                bss_data.input_kworker_tgids[i] = tgid;
+            }
+
+            // Clear remaining slots
+            for i in nr_input..16 {
+                bss_data.input_kworker_tgids[i] = 0;
+            }
+
+            if nr_input > 0 {
+                debug!(
+                    "Updated BPF with {} input kworker(s): {:?}",
+                    nr_input, input_tgids
+                );
+            }
+        }
+    }
+
+    /// Update BPF ksoftirqd tracking
+    fn update_bpf_ksoftirqd(&mut self, ksoftirqd_tgids: &[u32]) {
+        if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
+            let nr_ksoftirqd = ksoftirqd_tgids.len().min(16);
+            bss_data.nr_ksoftirqd_tgids = nr_ksoftirqd as u32;
+
+            for (i, &tgid) in ksoftirqd_tgids.iter().take(16).enumerate() {
+                bss_data.ksoftirqd_tgids[i] = tgid;
+            }
+
+            // Clear remaining slots
+            for i in nr_ksoftirqd..16 {
+                bss_data.ksoftirqd_tgids[i] = 0;
+            }
+
+            if nr_ksoftirqd > 0 {
+                debug!(
+                    "Updated BPF with {} ksoftirqd thread(s): {:?}",
+                    nr_ksoftirqd, ksoftirqd_tgids
+                );
+            }
+        }
+    }
+
     /// Update BPF sched state
     fn update_bpf_sched_state(&mut self, state: u32) {
         if let Some(bss_data) = self.skel.maps.bss_data.as_mut() {
@@ -1562,6 +1721,30 @@ impl<'a> Scheduler<'a> {
         }
         self.update_bpf_de_tgids(&de_tgids);
 
+        // Initial input detection (NEW)
+        let input_kworker_tgids = self.detect_input_kworkers();
+        if !input_kworker_tgids.is_empty() {
+            info!(
+                "Detected {} input kworker(s): {:?}",
+                input_kworker_tgids.len(),
+                input_kworker_tgids
+            );
+        } else {
+            info!("No input kworkers detected (may appear later)");
+        }
+        self.update_bpf_input_kworkers(&input_kworker_tgids);
+
+        // Initial ksoftirqd detection (NEW)
+        let ksoftirqd_tgids = self.detect_ksoftirqd_threads();
+        if !ksoftirqd_tgids.is_empty() {
+            info!(
+                "Detected {} ksoftirqd thread(s): {:?}",
+                ksoftirqd_tgids.len(),
+                ksoftirqd_tgids
+            );
+        }
+        self.update_bpf_ksoftirqd(&ksoftirqd_tgids);
+
         // Initial parameter sync: write default PIE params to BPF
         let nr_cpus = self.nr_cpus;
         for cpu in 0..nr_cpus {
@@ -1596,6 +1779,28 @@ impl<'a> Scheduler<'a> {
                     );
                 }
                 self.update_bpf_de_tgids(&de_tgids);
+
+                // Detect input kworkers (NEW)
+                let input_kworker_tgids = self.detect_input_kworkers();
+                if !input_kworker_tgids.is_empty() {
+                    debug!(
+                        "Detected {} input kworker(s): {:?}",
+                        input_kworker_tgids.len(),
+                        input_kworker_tgids
+                    );
+                }
+                self.update_bpf_input_kworkers(&input_kworker_tgids);
+
+                // Detect ksoftirqd threads (NEW)
+                let ksoftirqd_tgids = self.detect_ksoftirqd_threads();
+                if !ksoftirqd_tgids.is_empty() {
+                    debug!(
+                        "Detected {} ksoftirqd thread(s): {:?}",
+                        ksoftirqd_tgids.len(),
+                        ksoftirqd_tgids
+                    );
+                }
+                self.update_bpf_ksoftirqd(&ksoftirqd_tgids);
 
                 // Detect turbo processes
                 let turbo_tgids = self.detect_turbo_processes();
