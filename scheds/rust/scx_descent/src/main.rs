@@ -208,7 +208,12 @@ struct Opts {
     #[clap(short = 'f', long, action = clap::ArgAction::SetTrue)]
     cpufreq: bool,
 
-    /// Profile selection (gaming, productivity, server)
+    /// Profile selection: gaming, production, server
+    ///
+    /// Profile defaults:
+    ///   gaming:       response=20ms, α=8, β=4,  lat_crit=500µs,  normal=2ms,  hog=10ms,  bg=50ms
+    ///   production:   response=20ms, α=8, β=4,  lat_crit=1ms,    normal=5ms,  hog=20ms,  bg=100ms  
+    ///   server:       response=50ms, α=16, β=8, lat_crit=2ms,    normal=10ms, hog=50ms,  bg=200ms
     #[clap(short = 'p', long, default_value = "productivity")]
     profile: String,
 
@@ -223,6 +228,70 @@ struct Opts {
     /// Enable autorate debug output every N ms
     #[clap(long, value_name = "N")]
     debug_autorate: Option<u64>,
+
+    /// Override profile response interval (ms). Lower = faster updates, higher = more stable.
+    /// Profile defaults: gaming=20, production=20, server=50
+    #[clap(long, value_name = "MS")]
+    response_ms: Option<u64>,
+
+    /// Override PIE alpha (proportional gain divisor). Higher = more conservative.
+    /// Profile defaults: gaming=8, production=8, server=16
+    #[clap(long, value_name = "N")]
+    pie_alpha: Option<u64>,
+
+    /// Override PIE beta (integral gain divisor). Higher = slower integral response.
+    /// Profile defaults: gaming=4, production=4, server=8
+    #[clap(long, value_name = "N")]
+    pie_beta: Option<u64>,
+
+    /// Override target latency for LATENCY_CRITICAL class (µs). Audio/games/compositors.
+    /// Profile defaults: gaming=500, production=1000, server=2000
+    #[clap(long, value_name = "MICROSECONDS")]
+    target_latency_critical: Option<u64>,
+
+    /// Override target latency for NORMAL class (µs). Default interactive tasks.
+    /// Profile defaults: gaming=2000, production=5000, server=10000
+    #[clap(long, value_name = "MICROSECONDS")]
+    target_latency_normal: Option<u64>,
+
+    /// Override target latency for HOG class (µs). High CPU usage tasks.
+    /// Profile defaults: gaming=10000, production=20000, server=50000
+    #[clap(long, value_name = "MICROSECONDS")]
+    target_latency_hog: Option<u64>,
+
+    /// Override target latency for BACKGROUND class (µs). Low priority tasks.
+    /// Profile defaults: gaming=50000, production=100000, server=200000
+    #[clap(long, value_name = "MICROSECONDS")]
+    target_latency_background: Option<u64>,
+
+    /// Autorate: high load threshold (0.0-1.0). Load above this triggers ramp up.
+    /// Profile defaults: gaming=0.75, production=0.75, server=0.80
+    #[clap(long, value_name = "FRACTION")]
+    autorate_high_load: Option<f64>,
+
+    /// Autorate: low load threshold (0.0-1.0). Load below this triggers ramp down.
+    /// Profile defaults: gaming=0.25, production=0.25, server=0.30
+    #[clap(long, value_name = "FRACTION")]
+    autorate_low_load: Option<f64>,
+
+    /// Autorate: ramp up rate multiplier (e.g., 1.04 = 4% increase).
+    /// Profile defaults: gaming=1.04, production=1.08, server=1.02
+    #[clap(long, value_name = "RATE")]
+    autorate_ramp_up: Option<f64>,
+
+    /// Autorate: ramp down rate multiplier (e.g., 0.85 = 15% decrease).
+    /// Profile defaults: gaming=0.85, production=0.85, server=0.90
+    #[clap(long, value_name = "RATE")]
+    autorate_ramp_down: Option<f64>,
+
+    /// Autorate: decay rate toward baseline (e.g., 0.99 = 1% per interval).
+    /// Profile defaults: gaming=0.99, production=0.99, server=0.995
+    #[clap(long, value_name = "RATE")]
+    autorate_decay: Option<f64>,
+
+    /// Show detailed profile parameter defaults and exit
+    #[clap(long, action = clap::ArgAction::SetTrue, help_heading = "Help")]
+    help_profiles: bool,
 
     /// Update interval for parameter sync (ms)
     #[clap(long, default_value = "50")]
@@ -291,6 +360,131 @@ const DESCENT_CLASS_MAX: usize = 4;
 /// class_params[4] = 4 * (5 * 8 bytes) = 160 bytes
 const CLASS_LOSS_OFFSET: usize = 160;
 
+/// Print detailed profile help showing all default values
+fn print_profile_help() {
+    use crate::profiles::Profile;
+
+    println!("scx_descent Profile Parameter Defaults");
+    println!("======================================");
+    println!();
+
+    let gaming = Profile::gaming();
+    let prod = Profile::production();
+    let server = Profile::server();
+
+    // Core PIE Parameters
+    println!("Core PIE Parameters:");
+    println!(
+        "  {:30} {:>12} {:>15} {:>15}",
+        "Parameter", "Gaming", "Production", "Server"
+    );
+    println!(
+        "  {:30} {:>12} {:>15} {:>15}",
+        "response_ms (update interval)", gaming.response_ms, prod.response_ms, server.response_ms
+    );
+    println!(
+        "  {:30} {:>12} {:>15} {:>15}",
+        "pie_alpha (proportional)", gaming.pie_alpha, prod.pie_alpha, server.pie_alpha
+    );
+    println!(
+        "  {:30} {:>12} {:>15} {:>15}",
+        "pie_beta (integral)", gaming.pie_beta, prod.pie_beta, server.pie_beta
+    );
+    println!();
+
+    // Target Latencies
+    println!("Target Latencies (microseconds):");
+    println!(
+        "  {:30} {:>12} {:>15} {:>15}",
+        "Class", "Gaming", "Production", "Server"
+    );
+    let classes = ["LATENCY_CRITICAL", "NORMAL", "HOG", "BACKGROUND"];
+    for (i, class) in classes.iter().enumerate() {
+        let g_lat = gaming.target_latencies_ns[i] / 1000;
+        let p_lat = prod.target_latencies_ns[i] / 1000;
+        let s_lat = server.target_latencies_ns[i] / 1000;
+        println!("  {:30} {:>12} {:>15} {:>15}", class, g_lat, p_lat, s_lat);
+    }
+    println!();
+
+    // Autorate Parameters (only for gaming/production - server has enabled=false)
+    println!("CAKE Autorate Parameters:");
+    println!(
+        "  {:30} {:>12} {:>15} {:>15}",
+        "Parameter", "Gaming", "Production", "Server"
+    );
+    println!(
+        "  {:30} {:>12.2} {:>15.2} {:>15.2}",
+        "high_load_threshold",
+        gaming.autorate.high_load_threshold,
+        prod.autorate.high_load_threshold,
+        server.autorate.high_load_threshold
+    );
+    println!(
+        "  {:30} {:>12.2} {:>15.2} {:>15.2}",
+        "low_load_threshold",
+        gaming.autorate.low_load_threshold,
+        prod.autorate.low_load_threshold,
+        server.autorate.low_load_threshold
+    );
+    println!(
+        "  {:30} {:>12.2} {:>15.2} {:>15.2}",
+        "ramp_up_rate",
+        gaming.autorate.ramp_up_rate,
+        prod.autorate.ramp_up_rate,
+        server.autorate.ramp_up_rate
+    );
+    println!(
+        "  {:30} {:>12.2} {:>15.2} {:>15.2}",
+        "ramp_down_rate",
+        gaming.autorate.ramp_down_rate,
+        prod.autorate.ramp_down_rate,
+        server.autorate.ramp_down_rate
+    );
+    println!(
+        "  {:30} {:>12.3} {:>15.3} {:>15.3}",
+        "decay_rate",
+        gaming.autorate.decay_rate,
+        prod.autorate.decay_rate,
+        server.autorate.decay_rate
+    );
+    println!(
+        "  {:30} {:>12} {:>15} {:>15}",
+        "refractory_up_ms",
+        gaming.autorate.adjust_up_refractory_ms,
+        prod.autorate.adjust_up_refractory_ms,
+        server.autorate.adjust_up_refractory_ms
+    );
+    println!(
+        "  {:30} {:>12} {:>15} {:>15}",
+        "refractory_down_ms",
+        gaming.autorate.adjust_down_refractory_ms,
+        prod.autorate.adjust_down_refractory_ms,
+        server.autorate.adjust_down_refractory_ms
+    );
+    println!(
+        "  {:30} {:>12.1} {:>15.1} {:>15.1}",
+        "bufferbloat_threshold",
+        gaming.autorate.bufferbloat_threshold,
+        prod.autorate.bufferbloat_threshold,
+        server.autorate.bufferbloat_threshold
+    );
+    println!();
+
+    // Profile descriptions
+    println!("Profile Descriptions:");
+    println!("  gaming:       Optimized for low-latency audio, games, and compositors.");
+    println!("                Tight latency targets (500µs for critical), moderate response.");
+    println!("  production:   Balanced for general desktop use. Good for mixed workloads.");
+    println!("                Moderate latency targets with balanced PIE tuning.");
+    println!("  server:       Conservative, throughput-focused. Best for background tasks.");
+    println!("                High latency tolerance, gentle parameter adjustments.");
+    println!();
+
+    println!("Use --profile <name> to select a base profile, then override specific");
+    println!("parameters with --response-ms, --pie-alpha, --target-latency-*, etc.");
+}
+
 /// Latency metrics structure for PIE controller
 #[derive(Debug, Default)]
 pub struct LatencyMetrics {
@@ -358,7 +552,65 @@ impl<'a> Scheduler<'a> {
         );
 
         // Load profile configuration using inherent method
-        let profile = Profile::from_str(&opts.profile).unwrap_or_else(|| Profile::default());
+        let mut profile = Profile::from_str(&opts.profile).unwrap_or_else(|| Profile::default());
+
+        // Apply CLI overrides to profile parameters
+        if let Some(response_ms) = opts.response_ms {
+            profile.response_ms = response_ms;
+            info!("Override: response_ms = {}ms", response_ms);
+        }
+        if let Some(alpha) = opts.pie_alpha {
+            profile.pie_alpha = alpha;
+            info!("Override: pie_alpha = {}", alpha);
+        }
+        if let Some(beta) = opts.pie_beta {
+            profile.pie_beta = beta;
+            info!("Override: pie_beta = {}", beta);
+        }
+
+        // Apply target latency overrides (convert µs to ns)
+        if let Some(latency_us) = opts.target_latency_critical {
+            profile.target_latencies_ns[0] = latency_us * 1000;
+            info!("Override: target_latency_critical = {}µs", latency_us);
+        }
+        if let Some(latency_us) = opts.target_latency_normal {
+            profile.target_latencies_ns[1] = latency_us * 1000;
+            info!("Override: target_latency_normal = {}µs", latency_us);
+        }
+        if let Some(latency_us) = opts.target_latency_hog {
+            profile.target_latencies_ns[2] = latency_us * 1000;
+            info!("Override: target_latency_hog = {}µs", latency_us);
+        }
+        if let Some(latency_us) = opts.target_latency_background {
+            profile.target_latencies_ns[3] = latency_us * 1000;
+            info!("Override: target_latency_background = {}µs", latency_us);
+        }
+
+        // Apply autorate overrides if autorate is enabled
+        if opts.autorate {
+            profile.autorate.enabled = true; // Enable autorate in profile config
+            if let Some(threshold) = opts.autorate_high_load {
+                profile.autorate.high_load_threshold = threshold;
+                info!("Override: autorate_high_load = {:.2}", threshold);
+            }
+            if let Some(threshold) = opts.autorate_low_load {
+                profile.autorate.low_load_threshold = threshold;
+                info!("Override: autorate_low_load = {:.2}", threshold);
+            }
+            if let Some(rate) = opts.autorate_ramp_up {
+                profile.autorate.ramp_up_rate = rate;
+                info!("Override: autorate_ramp_up = {:.2}", rate);
+            }
+            if let Some(rate) = opts.autorate_ramp_down {
+                profile.autorate.ramp_down_rate = rate;
+                info!("Override: autorate_ramp_down = {:.2}", rate);
+            }
+            if let Some(rate) = opts.autorate_decay {
+                profile.autorate.decay_rate = rate;
+                info!("Override: autorate_decay = {:.3}", rate);
+            }
+        }
+
         info!("Using profile: {}", profile);
 
         let nr_cpus = topo.all_cpus.len();
@@ -1828,6 +2080,11 @@ fn main() -> Result<()> {
             SCHEDULER_NAME,
             build_id::full_version(env!("CARGO_PKG_VERSION"))
         );
+        return Ok(());
+    }
+
+    if opts.help_profiles {
+        print_profile_help();
         return Ok(());
     }
 

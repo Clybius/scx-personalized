@@ -84,47 +84,47 @@ impl Profile {
                 // BACKGROUND
                 [1_000_000, 2_000_000, 1024, 100, 20_000],
             ],
-            // Gaming: wider bounds for aggressive optimization
+            // Gaming: moderate bounds for stability while maintaining responsiveness
             bounds: [
-                // LATENCY_CRITICAL bounds
+                // LATENCY_CRITICAL bounds - tighter for stability
                 [
-                    (10_000, 10_000_000),  // latency_weight
-                    (100_000, 10_000_000), // base_slice_ns
-                    (256, 2048),           // vruntime_scale
-                    (10, 200),             // preemption_priority
-                    (1_000, 10_000_000),   // migration_cost
+                    (50_000, 2_000_000),  // latency_weight: tighter than before
+                    (200_000, 2_000_000), // base_slice_ns: tighter range
+                    (384, 1024),          // vruntime_scale: narrower range
+                    (50, 100),            // preemption_priority: fixed-ish for stability
+                    (5_000, 500_000),     // migration_cost: tighter range
                 ],
                 // NORMAL bounds
                 [
-                    (10_000, 10_000_000),  // latency_weight
-                    (100_000, 10_000_000), // base_slice_ns
-                    (256, 2048),           // vruntime_scale
-                    (10, 200),             // preemption_priority
-                    (1_000, 10_000_000),   // migration_cost
+                    (100_000, 3_000_000), // latency_weight
+                    (300_000, 3_000_000), // base_slice_ns
+                    (512, 1280),          // vruntime_scale
+                    (50, 100),            // preemption_priority
+                    (10_000, 500_000),    // migration_cost
                 ],
-                // HOG bounds
+                // HOG bounds - constrain to prevent CPU hogging
                 [
-                    (10_000, 10_000_000),  // latency_weight
-                    (100_000, 10_000_000), // base_slice_ns
-                    (256, 2048),           // vruntime_scale
-                    (10, 200),             // preemption_priority
-                    (1_000, 10_000_000),   // migration_cost
+                    (500_000, 8_000_000),   // latency_weight: higher min to deprioritize
+                    (1_000_000, 8_000_000), // base_slice_ns: constrained max
+                    (1024, 1920),           // vruntime_scale: capped to prevent extreme prio
+                    (50, 100),              // preemption_priority
+                    (30_000, 500_000),      // migration_cost
                 ],
                 // BACKGROUND bounds
                 [
-                    (10_000, 10_000_000),  // latency_weight
-                    (100_000, 10_000_000), // base_slice_ns
-                    (256, 2048),           // vruntime_scale
-                    (10, 200),             // preemption_priority
-                    (1_000, 10_000_000),   // migration_cost
+                    (100_000, 4_000_000), // latency_weight
+                    (500_000, 4_000_000), // base_slice_ns
+                    (768, 1536),          // vruntime_scale
+                    (50, 100),            // preemption_priority
+                    (10_000, 500_000),    // migration_cost
                 ],
             ],
-            response_ms: 10, // Fast response for gaming
-            pie_alpha: 4,    // Aggressive proportional gain
-            pie_beta: 2,     // Fast integral response
+            response_ms: 20, // Balanced response (was 10ms - too aggressive)
+            pie_alpha: 8,    // Balanced proportional gain (was 4 - too aggressive)
+            pie_beta: 4,     // Balanced integral response (was 2 - too aggressive)
             pie_max_integral: 1_000_000,
             target_latencies_ns: [
-                500_000,    // LATENCY_CRITICAL: 500 µs
+                500_000,    // LATENCY_CRITICAL: 500 µs (keep tight for audio/games)
                 2_000_000,  // NORMAL: 2 ms
                 10_000_000, // HOG: 10 ms
                 50_000_000, // BACKGROUND: 50 ms
@@ -133,14 +133,14 @@ impl Profile {
                 enabled: false, // Default: disabled (opt-in via --autorate)
 
                 // Per-class min/baseline/max parameters
-                // Gaming: aggressive max for LATENCY_CRITICAL, wide ranges
+                // Gaming: balanced ranges for stability with autorate
                 min_params: [
                     // LATENCY_CRITICAL: conservative minimums
                     [50_000, 300_000, 384, 50, 5_000],
                     // NORMAL
                     [100_000, 500_000, 512, 50, 10_000],
-                    // HOG
-                    [500_000, 2_000_000, 1024, 50, 30_000],
+                    // HOG: higher min to reduce CPU hogging impact
+                    [1_000_000, 3_000_000, 1280, 50, 50_000],
                     // BACKGROUND
                     [100_000, 500_000, 512, 50, 10_000],
                 ],
@@ -149,32 +149,31 @@ impl Profile {
                     [100_000, 600_000, 512, 50, 10_000],
                     // NORMAL
                     [1_000_000, 2_000_000, 768, 100, 30_000],
-                    // HOG
-                    [5_000_000, 10_000_000, 1536, 100, 100_000],
+                    // HOG: constrained baseline
+                    [3_000_000, 5_000_000, 1536, 100, 80_000],
                     // BACKGROUND
                     [1_000_000, 2_000_000, 1024, 100, 20_000],
                 ],
                 max_params: [
-                    // LATENCY_CRITICAL: very aggressive for low latency
-                    // Within bounds: (10K,10M), (100K,10M), (256,2048), (10,200), (1K,10M)
-                    [2_000_000, 5_000_000, 1536, 150, 500_000],
-                    // NORMAL - within bounds
-                    [5_000_000, 8_000_000, 1536, 150, 800_000],
-                    // HOG - within bounds
-                    [8_000_000, 9_000_000, 1920, 150, 900_000],
-                    // BACKGROUND - within bounds
-                    [5_000_000, 8_000_000, 1536, 150, 800_000],
+                    // LATENCY_CRITICAL: capped for stability
+                    [1_000_000, 1_500_000, 768, 100, 200_000],
+                    // NORMAL - constrained
+                    [3_000_000, 5_000_000, 1024, 100, 300_000],
+                    // HOG - strictly capped to prevent monopolization
+                    [5_000_000, 6_000_000, 1792, 100, 400_000],
+                    // BACKGROUND - constrained
+                    [3_000_000, 4_000_000, 1280, 100, 200_000],
                 ],
 
-                // Aggressive gaming tuning
+                // Balanced gaming tuning (more conservative than before)
                 high_load_threshold: 0.75,
                 low_load_threshold: 0.25,
-                ramp_up_rate: 1.08,            // 8% increase (aggressive)
-                ramp_down_rate: 0.75,          // 25% decrease
-                decay_rate: 0.98,              // 2% decay toward baseline
-                adjust_up_refractory_ms: 50,   // 50ms between upward adjustments
-                adjust_down_refractory_ms: 20, // 20ms between downward
-                bufferbloat_threshold: 1.5,    // 1.5x target = bufferbloat
+                ramp_up_rate: 1.04,   // 4% increase (was 8% - too aggressive)
+                ramp_down_rate: 0.85, // 15% decrease (was 25% - too aggressive)
+                decay_rate: 0.99,     // 1% decay toward baseline (was 2%)
+                adjust_up_refractory_ms: 100, // 100ms between upward adjustments (was 50ms)
+                adjust_down_refractory_ms: 50, // 50ms between downward (was 20ms)
+                bufferbloat_threshold: 1.6, // 1.6x target = bufferbloat (was 1.5x)
             },
         }
     }
@@ -459,9 +458,9 @@ mod tests {
     fn test_gaming_profile() {
         let p = Profile::gaming();
         assert_eq!(p.name, "gaming");
-        assert_eq!(p.response_ms, 10);
-        assert_eq!(p.pie_alpha, 4);
-        assert_eq!(p.pie_beta, 2);
+        assert_eq!(p.response_ms, 20); // Updated: was 10
+        assert_eq!(p.pie_alpha, 8); // Updated: was 4
+        assert_eq!(p.pie_beta, 4); // Updated: was 2
     }
 
     #[test]
