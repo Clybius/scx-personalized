@@ -257,6 +257,31 @@ struct Opts {
     #[clap(long, value_name = "MICROSECONDS")]
     target_latency_background: Option<u64>,
 
+    /// Enable PURPLE-AIMD enhancements to PIE controller
+    ///
+    /// When enabled, adds:
+    /// - Recovery phase hysteresis (requires consecutive good samples for integral growth)
+    /// - Linear regression trend analysis for predictive adjustments
+    /// - Reduces oscillation and improves stability
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    purple_aimd: bool,
+
+    /// PURPLE-AIMD: Consecutive good latency samples required for recovery phase
+    #[clap(long, default_value = "5", requires = "purple_aimd")]
+    purple_recovery_threshold: u32,
+
+    /// PURPLE-AIMD: Latency tolerance for "good" classification (microseconds)
+    #[clap(long, default_value = "500", requires = "purple_aimd")]
+    purple_latency_tolerance_us: i64,
+
+    /// PURPLE-AIMD: Window size for trend calculation
+    #[clap(long, default_value = "5", requires = "purple_aimd")]
+    purple_trend_window: usize,
+
+    /// PURPLE-AIMD: Prediction weight (0.0-1.0) for blending current and predicted latency
+    #[clap(long, default_value = "0.3", requires = "purple_aimd")]
+    purple_prediction_weight: f64,
+
     /// Show detailed profile parameter defaults and exit
     #[clap(long, action = clap::ArgAction::SetTrue, help_heading = "Help")]
     help_profiles: bool,
@@ -582,6 +607,23 @@ impl<'a> Scheduler<'a> {
         // Initialize Phase 4 components - PIE Controller
         let mut pie = PieController::new(nr_cpus, &profile);
 
+        // Enable PURPLE-AIMD mode if requested
+        if opts.purple_aimd {
+            info!(
+                "[PURPLE-AIMD] Enabling PIE controller enhancements: threshold={}, tolerance={}µs, window={}, weight={:.2}",
+                opts.purple_recovery_threshold,
+                opts.purple_latency_tolerance_us,
+                opts.purple_trend_window,
+                opts.purple_prediction_weight
+            );
+            pie.enable_purple_aimd(
+                opts.purple_recovery_threshold,
+                opts.purple_latency_tolerance_us * 1000, // Convert µs to ns
+                opts.purple_trend_window,
+                opts.purple_prediction_weight,
+            );
+        }
+
         // Enable bound debugging if requested
         if opts.debug_bounds.is_some() {
             pie.set_bound_debugging(true);
@@ -784,6 +826,13 @@ impl<'a> Scheduler<'a> {
         let mut total_error = 0i64;
         let mut total_updates = 0u64;
 
+        // PURPLE-AIMD aggregation
+        let mut purple_enabled = 0u64;
+        let mut recovery_phase_count = 0u64;
+        let mut total_good_count = 0u64;
+        let mut total_trend = 0f64;
+        let mut trend_count = 0u32;
+
         for cpu in 0..self.nr_cpus as u32 {
             for class in 0..4u32 {
                 if let Some(state) = self.pie.get_state(cpu, class) {
@@ -794,6 +843,20 @@ impl<'a> Scheduler<'a> {
 
                     let error = state.current_latency_ns as i64 - state.target_latency_ns as i64;
                     total_error += error;
+
+                    // Collect PURPLE-AIMD stats
+                    if state.purple_aimd_enabled {
+                        purple_enabled = 1;
+                        if state.is_in_recovery_phase() {
+                            recovery_phase_count += 1;
+                        }
+                        total_good_count += state.get_good_latency_count() as u64;
+                        let trend = state.get_latency_trend();
+                        if trend != 0.0 {
+                            total_trend += trend;
+                            trend_count += 1;
+                        }
+                    }
                 }
             }
         }
@@ -805,6 +868,24 @@ impl<'a> Scheduler<'a> {
         };
         let avg_error = if latency_count > 0 {
             total_error / latency_count as i64
+        } else {
+            0
+        };
+
+        // Calculate PURPLE-AIMD averages
+        let avg_recovery_active = if latency_count > 0 && recovery_phase_count > (latency_count / 2)
+        {
+            1u64
+        } else {
+            0u64
+        };
+        let avg_good_count = if latency_count > 0 {
+            total_good_count / latency_count
+        } else {
+            0
+        };
+        let avg_trend = if trend_count > 0 {
+            (total_trend / trend_count as f64) as i64
         } else {
             0
         };
@@ -826,6 +907,12 @@ impl<'a> Scheduler<'a> {
             pie_target_latency_us: 0,               // TODO: get from profile
             pie_integral: total_integral / 1024,    // De-scale
             pie_latency_error_us: avg_error / 1000, // Convert to µs
+
+            // PURPLE-AIMD metrics
+            purple_aimd_enabled: purple_enabled,
+            pie_recovery_phase: avg_recovery_active,
+            pie_good_latency_count: avg_good_count,
+            pie_latency_trend_ns: avg_trend,
         }
     }
 

@@ -44,11 +44,21 @@ pub struct Metrics {
     pub pie_integral: i64,
     #[stat(desc = "PIE controller latency error (µs)")]
     pub pie_latency_error_us: i64,
+
+    // PURPLE-AIMD statistics
+    #[stat(desc = "PURPLE-AIMD mode enabled (1=yes, 0=no)")]
+    pub purple_aimd_enabled: u64,
+    #[stat(desc = "PIE recovery phase active (1=yes, 0=no, PURPLE-AIMD)")]
+    pub pie_recovery_phase: u64,
+    #[stat(desc = "PIE consecutive good latency count (PURPLE-AIMD)")]
+    pub pie_good_latency_count: u64,
+    #[stat(desc = "PIE latency trend (ns/sample, PURPLE-AIMD)")]
+    pub pie_latency_trend_ns: i64,
 }
 
 impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
-        writeln!(
+        write!(
             w,
             "[{}] tasks -> r: {:>2}/{:<2} | dispatch -> k: {:<5} d: {:<5} s: {:<5} | pie: updates={} lat={}µs err={}µs | classes: lc:{} n:{} h:{} bg:{}",
             crate::SCHEDULER_NAME,
@@ -65,6 +75,23 @@ impl Metrics {
             self.nr_tasks_hog,
             self.nr_tasks_background,
         )?;
+
+        // Add PURPLE-AIMD info if enabled
+        if self.purple_aimd_enabled == 1 {
+            write!(
+                w,
+                " | purple: rec={} good_cnt={} trend={}µs",
+                if self.pie_recovery_phase == 1 {
+                    "Y"
+                } else {
+                    "N"
+                },
+                self.pie_good_latency_count,
+                self.pie_latency_trend_ns / 1000
+            )?;
+        }
+
+        writeln!(w)?;
         Ok(())
     }
 
@@ -84,6 +111,11 @@ impl Metrics {
             nr_tasks_background: self.nr_tasks_background,
             nr_running: self.nr_running,
             nr_cpus: self.nr_cpus,
+            // PURPLE-AIMD fields (cumulative, not delta)
+            purple_aimd_enabled: self.purple_aimd_enabled,
+            pie_recovery_phase: self.pie_recovery_phase,
+            pie_good_latency_count: self.pie_good_latency_count,
+            pie_latency_trend_ns: self.pie_latency_trend_ns,
         }
     }
 }
@@ -129,4 +161,9 @@ pub struct PieStateStats {
     pub integral_accum: i64,
     pub current_params: [u64; 5],
     pub update_count: u64,
+    // PURPLE-AIMD fields
+    pub purple_aimd_enabled: bool,
+    pub recovery_phase: bool,
+    pub good_latency_count: u32,
+    pub latency_trend: f64,
 }
