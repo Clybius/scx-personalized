@@ -6,8 +6,6 @@ This is a single user-defined scheduler used within [`sched_ext`](https://github
 
 **scx_descent** is a PIE (Proportional Integral controller Enhanced) based adaptive scheduler that automatically optimizes scheduling parameters for different workload classes. Unlike traditional schedulers with static parameters, scx_descent continuously adapts its behavior based on observed latency using deterministic control theory.
 
-**Optional CAKE Autorate**: scx_descent now supports an optional CAKE Autorate mode that adds load-aware adaptation. When enabled (`--autorate`), the scheduler uses a two-stage control system: CAKE Autorate provides coarse "gear selection" (min/baseline/max parameters) based on per-class load, while PIE provides fine-tuning within the selected gear based on per-CPU latency.
-
 ### How It Differs from scx_flash
 
 While **scx_flash** uses static parameters optimized for multimedia and audio workloads, **scx_descent** introduces:
@@ -27,14 +25,8 @@ While **scx_flash** uses static parameters optimized for multimedia and audio wo
 
 3. **Deterministic control**: Unlike probabilistic or gradient-based approaches, PIE provides predictable, deterministic parameter adjustment with fast convergence and no random exploration.
 
-4. **Optional CAKE Autorate** (`--autorate` flag): Adds load-aware adaptation with:
-   - Three-tier parameters per class: min (safe), baseline (default), max (aggressive)
-   - Four-state load management: STEADY, LOAD_HIGH, LOAD_LOW, BUFFERBLOAT
-   - Per-class load tracking with refractory periods to prevent oscillation
-   - Linear interpolation between parameter tiers for smooth transitions
-
-5. **Three optimization profiles**:
-   - **Gaming**: Prioritize low latency (10ms response, α=4, β=2, 8% ramp-up)
+4. **Three optimization profiles**:
+   - **Gaming**: Prioritize low latency (20ms response, α=8, β=4, 8% ramp-up)
    - **Productivity**: Balance latency and throughput (20ms response, α=8, β=4, 4% ramp-up)
    - **Server**: Maximize stability (50ms response, α=16, β=8, 2% ramp-up)
 
@@ -49,50 +41,6 @@ The PIE controller operates on each (CPU, class) combination:
    - I-term: Accumulates trend (rate of change of latency)
 4. **Parameter Update**: Adjusts all 5 scheduling parameters based on control output
 5. **Bounds Enforcement**: Ensures parameters stay within safe limits per profile
-
-## CAKE Autorate Architecture (Optional)
-
-When enabled with `--autorate`, scx_descent uses a two-stage control system:
-
-### Two-Stage Control
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 1: CAKE Autorate (Per-Class Load Tracking)               │
-├─────────────────────────────────────────────────────────────────┤
-│  • Aggregate load across all CPUs per class                   │
-│  • Aggregate latency across all CPUs per class                │
-│  • Four-state machine: STEADY, LOAD_HIGH, LOAD_LOW, BUFFERBLOAT │
-│  • Linear interpolation: min (0.0) ↔ baseline (0.5) ↔ max (1.0) │
-│  • Refractory periods prevent oscillation                       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Stage 2: PIE Controller (Per-(CPU, Class) Fine-Tuning)         │
-├─────────────────────────────────────────────────────────────────┤
-│  • Local latency measurement per (CPU, class)                  │
-│  • P-term + I-term adjustment to base_params from Autorate     │
-│  • Per-CPU optimization within the selected "gear"             │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### State Machine
-
-| State | Condition | Action |
-|-------|-----------|--------|
-| **STEADY** | Normal load & latency | Minimal adjustment, slight decay toward baseline |
-| **LOAD_HIGH** | Load > 75%, latency good | Ramp toward max parameters (opportunity) |
-| **LOAD_LOW** | Load < 25% | Decay toward baseline (conserve) |
-| **BUFFERBLOAT** | Latency > 1.5× target | Emergency ramp toward min (restore latency) |
-
-### Three-Tier Parameters
-
-| Tier | Purpose | When Used |
-|------|---------|-----------|
-| **min** | Safe, conservative | Bufferbloat detected, system stress |
-| **baseline** | Known-good default | Steady state, no significant load |
-| **max** | Aggressive, low-latency | High load with good latency |
 
 ## Architecture
 
@@ -157,47 +105,45 @@ sudo scx_descent --debug-pie 100
 
 ### Command Line Options
 
-```
-Options:
-  -s, --slice-us <US>              Maximum scheduling slice duration [default: 700]
-  -l, --slice-us-lag <US>          Sleep budget in microseconds [default: 20000]
-  -t, --throttle-us <US>           Throttle CPUs by injecting idle cycles [default: 0]
-  -T, --tickless                   Enable tickless mode
-  -R, --rr-sched                   Enable round-robin scheduling
-  -m, --primary-domain <DOMAIN>    Primary CPU domain [default: auto]
-  -p, --profile <PROFILE>          Profile: gaming, productivity, server [default: productivity]
-      --autorate                   Enable CAKE Autorate for load-aware adaptation
-      --debug-pie <N>              Enable PIE controller debug output every N ms
-      --debug-autorate <N>         Enable Autorate debug output every N ms
-  -h, --help                       Print help
-```
+#### Core Scheduling Options
+- `-s, --slice-us <US>` - Maximum scheduling slice duration in microseconds [default: 700]
+- `-l, --slice-us-lag <US>` - Maximum runtime budget for sleeping tasks in microseconds [default: 20000]
+- `-t, --throttle-us <US>` - Throttle CPUs by injecting idle cycles [default: 0]
+- `-I, --idle-resume-us <US>` - Set CPU idle QoS resume latency in microseconds (-1 = disabled) [default: -1]
+- `-T, --tickless` - Enable tickless mode
+- `-R, --rr-sched` - Enable round-robin scheduling
 
-### CAKE Autorate Usage (Optional)
+#### CPU Domain Options
+- `-m, --primary-domain <DOMAIN>` - Primary CPU domain (auto, powersave, performance, turbo, all, or hex mask) [default: auto]
+- `--disable-smt` - Disable SMT awareness
+- `--disable-numa` - Disable NUMA rebalancing
+- `-f, --cpufreq` - Enable CPU frequency control (only with schedutil governor)
 
-```bash
-# Default: PIE-only mode (deterministic latency-based tuning)
-sudo scx_descent --profile gaming
+#### Profile and Tuning Options
+- `-p, --profile <PROFILE>` - Profile selection: gaming, productivity, server [default: productivity]
+- `--response-ms <MS>` - Override profile response interval (lower = faster updates)
+- `--pie-alpha <N>` - Override PIE alpha (proportional gain divisor)
+- `--pie-beta <N>` - Override PIE beta (integral gain divisor)
+- `--target-latency-critical <US>` - Override target latency for LATENCY_CRITICAL class (microseconds)
+- `--target-latency-normal <US>` - Override target latency for NORMAL class (microseconds)
+- `--target-latency-hog <US>` - Override target latency for HOG class (microseconds)
+- `--target-latency-background <US>` - Override target latency for BACKGROUND class (microseconds)
+- `--audio-cgroup <PATH>` - Audio cgroup path for automatic classification
+- `--update-interval-ms <MS>` - Update interval for parameter sync [default: 50]
 
-# Enable CAKE Autorate (opt-in): Two-stage load-aware adaptation
-sudo scx_descent --profile gaming --autorate
+#### Debug Options
+- `--debug-pie <N>` - Enable PIE controller debug output every N milliseconds
+- `--debug-bounds <N>` - Enable parameter bounds debugging every N milliseconds
+- `-d, --debug` - Enable BPF debugging via /sys/kernel/tracing/trace_pipe
+- `-v, --verbose` - Enable verbose output including libbpf details
 
-# Gaming with aggressive ramp-up
-sudo scx_descent --profile gaming --autorate
-
-# Server with conservative stability-focused tuning
-sudo scx_descent --profile server --autorate
-
-# Debug both controllers
-sudo scx_descent --profile gaming --autorate --debug-pie 100 --debug-autorate 1000
-```
-
-### Profile-Specific Autorate Behavior
-
-| Profile | Ramp Up | Ramp Down | Characteristics |
-|-----------|---------|-----------|-----------------|
-| **Gaming** | 8% per cycle | 25% per cycle | Aggressive, fast adaptation |
-| **Productivity** | 4% per cycle | 20% per cycle | Balanced, moderate adaptation |
-| **Server** | 2% per cycle | 10% per cycle | Conservative, slow & stable |
+#### Help and Stats Options
+- `--help-profiles` - Show detailed profile parameter defaults and exit
+- `--help-stats` - Show descriptions for statistics and exit
+- `--stats <INTERVAL>` - Enable stats monitoring with specified interval in seconds
+- `--monitor <INTERVAL>` - Run in stats monitoring mode (no scheduler)
+- `-V, --version` - Print scheduler version and exit
+- `-h, --help` - Print help
 
 ### Monitoring
 
@@ -236,13 +182,65 @@ export SCX_DESCENT_TURBO=1
 - All threads in the process (matching TGID) receive turbo priority
 - Changes are applied dynamically without restarting the scheduler
 
+### Automatic Process Detection
+
+scx_descent automatically detects and prioritizes several types of system processes by scanning `/proc`:
+
+#### Audio Daemon Detection
+Automatically detects and prioritizes audio daemons by scanning for known audio process names:
+- **pipewire**, **wireplumber**, **pipewire-pulse** - Modern Linux audio stack
+- **pulseaudio** - Legacy PulseAudio server
+- **jackd**, **jackdbus** - JACK audio server
+
+Detected audio processes are classified as `LATENCY_CRITICAL` to ensure uninterrupted audio playback.
+
+#### Input Kworker Detection
+Detects input-related kernel worker threads by identifying processes with parent PID 2 (kthreadd) and matching patterns:
+- `ksoftirqd/*` - Deferred interrupt handlers (critical for input latency)
+- `hid-*` - HID (Human Interface Device) workers
+- `usbhid` - USB HID workers
+- `input_*` - Input event handlers
+- `irq/*` - IRQ workers for input devices
+
+These threads are critical for input latency and receive priority scheduling.
+
+#### ksoftirqd Detection
+Dedicated detection for ksoftirqd threads which handle the bottom half of interrupt processing, including input device interrupts. All ksoftirqd threads (named `ksoftirqd/N` where N is the CPU number) are detected and prioritized.
+
+#### Desktop Environment Detection
+Detects running Desktop Environment components by process name to ensure UI responsiveness:
+
+- **GNOME**: gnome-shell, gnome-panel, nautilus
+- **KDE Plasma**: plasmashell, kwin_wayland, kwin_x11, plasma-desktop, dolphin
+- **Sway**: sway, swaybar
+- **Hyprland**: Hyprland
+- **XFCE**: xfce4-panel, xfwm4, xfdesktop, thunar
+- **i3/sway**: i3, i3bar
+- **MATE**: marco, mate-panel, caja
+- **Cinnamon**: cinnamon, muffin, nemo
+- **LXQt**: lxqt-panel, pcmanfm-qt, pcmanfm
+- **Budgie**: budgie-panel, budgie-wm
+- **Wayfire**: wayfire
+- **Weston**: weston
+- **Gamescope**: gamescope (Steam Deck UI)
+- **Pantheon**: gala, wingpanel
+
+DE components are promoted to `LATENCY_CRITICAL` during non-GAMING states to ensure desktop responsiveness.
+
+#### Game Detection
+Detects game processes to automatically enter GAMING state:
+- **Steam games**: Detected via `SteamGameId=` or `STEAM_GAME=` environment variables
+- **Wine/Proton games**: Detected via `.exe` files in command line
+
+When a game is detected, the scheduler enters GAMING state and prioritizes the game process.
+
 This is ideal for benchmarks, real-time applications, or any workload that needs guaranteed low latency regardless of system load.
 
 ## Profile Configuration
 
 | Profile | Response | Alpha | Beta | Use Case |
 |---------|----------|-------|------|----------|
-| Gaming | 10ms | 4 | 2 | Fast response for games/audio |
+| Gaming | 20ms | 8 | 4 | Fast response for games/audio |
 | Productivity | 20ms | 8 | 4 | Balanced desktop use |
 | Server | 50ms | 16 | 8 | Stable server workloads |
 
@@ -256,16 +254,15 @@ This is ideal for benchmarks, real-time applications, or any workload that needs
 - ✅ **Phase 1**: Basic scheduler structure with task classification and per-class parameters
 - ✅ **Phase 2**: Safety mechanisms and parameter bounds
 - ✅ **Phase 3**: PIE controller with deterministic latency-based optimization
-- ✅ **Phase 4**: CAKE Autorate integration with load-aware adaptation (opt-in via `--autorate`)
-  - Per-class load tracking and state machine
-  - Three-tier parameters (min/baseline/max) with linear interpolation
-  - Two-stage control: Autorate (coarse) + PIE (fine)
-  - Profile-specific ramp rates (Gaming: 8%, Productivity: 4%, Server: 2%)
+- ✅ **Phase 4**: PIE controller with deterministic latency-based optimization (fully operational)
+  - Per-class parameter optimization
+  - Safety mechanisms and parameter bounds
+  - Automatic task classification with advanced detection (audio, input, DE, games)
 - ⚠️ **Phase 5** (Future): Advanced features like workload prediction, container awareness, hardware-specific profiles, dynamic reflector selection
 
 **Production Ready?**
 
-**Yes** - The scheduler is functional and includes adaptive parameter optimization via PIE controller. CAKE Autorate provides optional load-aware adaptation for dynamic workloads. The scheduler includes safety mechanisms and has been tested with 83+ passing tests. Extensive benchmarking against production workloads is recommended before deployment.
+**Yes** - The scheduler is functional and includes adaptive parameter optimization via PIE controller with automatic task classification. The scheduler includes safety mechanisms and has been tested with extensive unit tests. Extensive benchmarking against production workloads is recommended before deployment.
 
 ## License
 
