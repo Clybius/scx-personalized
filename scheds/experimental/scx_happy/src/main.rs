@@ -84,6 +84,10 @@ struct Opts {
     #[clap(long, value_name = "SECONDS")]
     stats: Option<u64>,
 
+    /// CPU usage threshold (%) to demote NORMAL tasks to HOG
+    #[clap(long, value_name = "PERCENT", default_value = "50")]
+    hog_cpu_threshold: u8,
+
     #[clap(flatten)]
     libbpf: LibbpfOpts,
 }
@@ -430,10 +434,37 @@ fn set_domain_cpu(skel: &mut BpfSkel, cpu: i32, queue: u32) -> Result<()> {
 }
 
 /// Print scheduler statistics
-fn print_scheduler_stats(_skel: &BpfSkel, classifier: &TaskClassifier) {
-    // For now, print classification stats only
-    // TODO: Add BPF map stats reading when properly configured
+fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
     info!("=== Scheduler Stats ===");
+
+    // Read BPF stats from BSS section
+    let (lc, normal, hog, preemptions, migrations, antistall, smt, classified) =
+        if let Some(bss) = skel.maps.bss_data.as_ref() {
+            (
+                bss.nr_lc_dispatches,
+                bss.nr_normal_dispatches,
+                bss.nr_hog_dispatches,
+                bss.nr_preemptions,
+                bss.nr_migrations,
+                bss.nr_antistall_dispatches,
+                bss.nr_smt_avoided,
+                bss.nr_classified_tasks,
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        };
+
+    let total_dispatches = lc + normal + hog;
+
+    info!(
+        "Dispatches: LC={}, NORMAL={}, HOG={} (total={})",
+        lc, normal, hog, total_dispatches
+    );
+    info!(
+        "Events: Preemptions={}, Migrations={}, SMT avoided={}, Antistall={}",
+        preemptions, migrations, smt, antistall
+    );
+    info!("Classified tasks tracked: {}", classified);
     info!(
         "Active classified tasks: SCX_TURBO={}, Steam={}, DE={}, Input={}, Audio={}",
         classifier.scx_turbo_tgids.len(),
@@ -544,6 +575,7 @@ fn main() -> Result<()> {
     rodata.antistall_enabled = !opts.disable_antistall;
     rodata.antistall_sec = opts.antistall_sec;
     rodata.debug = opts.verbose as u32;
+    rodata.hog_cpu_threshold = opts.hog_cpu_threshold;
 
     // Load the skeleton
     let mut skel = scx_ops_load!(open_skel, happy_ops, uei)?;

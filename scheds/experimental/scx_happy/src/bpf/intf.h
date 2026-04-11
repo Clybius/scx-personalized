@@ -49,6 +49,7 @@ enum happy_queue {
 #define HAPPY_VIRT_NICE_AUDIO (-28) /* Audio threads */
 #define HAPPY_VIRT_NICE_DE (-25) /* DE components */
 #define HAPPY_VIRT_NICE_KTHREAD (-10) /* Kernel threads (high-normal) */
+#define HAPPY_VIRT_NICE_HOG 30 /* Demoted to HOG queue */
 
 /* Task classification types for TGID maps */
 enum happy_task_type {

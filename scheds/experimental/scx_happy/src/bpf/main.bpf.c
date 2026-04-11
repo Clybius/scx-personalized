@@ -54,10 +54,24 @@ const volatile bool cpufreq_enabled   = true;
 const volatile bool antistall_enabled = true;
 const volatile u64  antistall_sec     = 3;
 
+/* HOG demotion parameters */
+const volatile u8  hog_cpu_threshold = 50; /* Default 50% CPU threshold */
+const volatile u64 hog_cpu_window_ns = 100000000; /* 100ms measurement window */
+
 /* Domain cpumask storage - global variables with __kptr */
 private(HAPPY) struct bpf_cpumask __kptr *lc_cpumask;
 private(HAPPY) struct bpf_cpumask __kptr *normal_cpumask;
 private(HAPPY) struct bpf_cpumask __kptr *hog_cpumask;
+
+/* Scheduling statistics - in BSS section, exposed to userspace */
+volatile u64	   nr_lc_dispatches;
+volatile u64	   nr_normal_dispatches;
+volatile u64	   nr_hog_dispatches;
+volatile u64	   nr_preemptions;
+volatile u64	   nr_migrations;
+volatile u64	   nr_antistall_dispatches;
+volatile u64	   nr_smt_avoided;
+volatile u64	   nr_classified_tasks;
 
 const volatile u32 debug    = 0;
 const u32	   zero_u32 = 0;
@@ -69,6 +83,12 @@ struct task_ctx {
 	u64		 last_run_at;
 	u64		 exec_runtime;
 	u64		 vtime; /* Virtual runtime */
+	s32 last_cpu; /* Last CPU task ran on, for migration tracking */
+
+	/* CPU tracking for HOG demotion */
+	u64  cpu_window_start; /* Start of current measurement window */
+	u64  cpu_window_runtime; /* Cumulative runtime in current window */
+	bool demote_to_hog; /* Flag: should be demoted on next enqueue */
 };
 
 /* Per-task storage map */
@@ -271,9 +291,16 @@ static inline u64 calc_vtime_scale(s16 virt_nice)
 /* Helper: map existing nice to virtual nice range */
 static inline s16 map_nice_to_virt(s32 nice)
 {
-	/* Map kernel nice (-20 to 19) to virtual nice (-50 to 49) */
-	/* Linear mapping: nice * 100/39 - 50, clamped to valid range */
-	s16 virt = (s16)((nice * 100) / 39 - 50);
+	/*
+	 * Map kernel nice (-20 to 19) to virtual nice (-50 to 49).
+	 * Linear mapping: spread 39 nice values across 99 virt values.
+	 * Formula: virt = (nice + 20) * 99 / 39 - 50
+	 *
+	 * nice=-20 → virt=-50 (LC min)
+	 * nice=0   → virt=0   (NORMAL center)
+	 * nice=19  → virt=49  (HOG max)
+	 */
+	s16 virt = (s16)(((nice + 20) * 99) / 39 - 50);
 	if (virt < HAPPY_VIRT_NICE_MIN)
 		virt = HAPPY_VIRT_NICE_MIN;
 	if (virt > HAPPY_VIRT_NICE_MAX)
@@ -385,6 +412,16 @@ static void init_task(struct task_struct *p, struct task_ctx *tctx)
 	tctx->vtime	   = vtime_now;
 	tctx->exec_runtime = 0;
 	tctx->last_run_at  = 0;
+	tctx->last_cpu	   = -1; /* Initialize to -1 to indicate never ran */
+
+	/* CPU tracking init for HOG demotion */
+	tctx->cpu_window_start	 = bpf_ktime_get_ns();
+	tctx->cpu_window_runtime = 0;
+	tctx->demote_to_hog	 = false;
+
+	/* Count classified tasks (non-default queue) */
+	if (tctx->queue != HAPPY_QUEUE_NORMAL)
+		__sync_fetch_and_add(&nr_classified_tasks, 1);
 }
 
 /* Helper: initialize a cpumask using bpf_kptr_xchg */
@@ -517,8 +554,11 @@ s32 BPF_STRUCT_OPS(happy_select_cpu, struct task_struct *p, s32 prev_cpu,
 		cpu = scx_bpf_select_cpu_and(
 			p, prev_cpu, wake_flags, domain_mask,
 			avoid_smt ? SCX_PICK_IDLE_CORE : 0);
-		if (cpu >= 0)
+		if (cpu >= 0) {
+			if (avoid_smt)
+				__sync_fetch_and_add(&nr_smt_avoided, 1);
 			return cpu;
+		}
 	}
 
 	/* Fallback: any allowed CPU */
@@ -538,6 +578,15 @@ void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
 	tctx			= lookup_task_ctx(p);
 	if (!tctx)
 		return;
+
+	/* Handle demotion if flagged */
+	if (tctx->demote_to_hog && tctx->queue == HAPPY_QUEUE_NORMAL) {
+		tctx->queue	    = HAPPY_QUEUE_HOG;
+		tctx->virt_nice	    = HAPPY_VIRT_NICE_HOG;
+		tctx->demote_to_hog = false;
+		if (debug)
+			bpf_printk("Task %d demoted to HOG queue", p->pid);
+	}
 
 	/* Update vtime */
 	u64 vtime_min = vtime_now - get_lag_for_queue(tctx->queue);
@@ -575,6 +624,8 @@ void BPF_STRUCT_OPS(happy_dispatch, s32 cpu, struct task_struct *prev)
 		u64 *antistall = bpf_map_lookup_elem(&antistall_dsq, &zero_u32);
 		if (antistall && *antistall != SCX_DSQ_INVALID) {
 			if (scx_bpf_dsq_move_to_local(*antistall, 0)) {
+				__sync_fetch_and_add(&nr_antistall_dispatches,
+						     1);
 				*antistall = SCX_DSQ_INVALID;
 				return;
 			}
@@ -583,20 +634,27 @@ void BPF_STRUCT_OPS(happy_dispatch, s32 cpu, struct task_struct *prev)
 
 	/* Consume in priority order: LC -> NORMAL -> HOG */
 	dsq_id = get_dsq_for_queue(HAPPY_QUEUE_LC, llc_id);
-	if (scx_bpf_dsq_move_to_local(dsq_id, 0))
+	if (scx_bpf_dsq_move_to_local(dsq_id, 0)) {
+		__sync_fetch_and_add(&nr_lc_dispatches, 1);
 		return;
+	}
 
 	dsq_id = get_dsq_for_queue(HAPPY_QUEUE_NORMAL, llc_id);
-	if (scx_bpf_dsq_move_to_local(dsq_id, 0))
+	if (scx_bpf_dsq_move_to_local(dsq_id, 0)) {
+		__sync_fetch_and_add(&nr_normal_dispatches, 1);
 		return;
+	}
 
 	dsq_id = get_dsq_for_queue(HAPPY_QUEUE_HOG, llc_id);
-	scx_bpf_dsq_move_to_local(dsq_id, 0);
+	if (scx_bpf_dsq_move_to_local(dsq_id, 0)) {
+		__sync_fetch_and_add(&nr_hog_dispatches, 1);
+	}
 }
 
 void BPF_STRUCT_OPS(happy_tick, struct task_struct *p)
 {
 	struct task_ctx *tctx;
+	u64		 now;
 
 	tctx = lookup_task_ctx(p);
 	if (!tctx)
@@ -617,6 +675,39 @@ void BPF_STRUCT_OPS(happy_tick, struct task_struct *p)
 	default:
 		break;
 	}
+
+	/* CPU tracking for HOG demotion - only for NORMAL tasks */
+	if (tctx->queue == HAPPY_QUEUE_NORMAL) {
+		now = bpf_ktime_get_ns();
+
+		/* Accumulate runtime in current window */
+		if (tctx->last_run_at > 0) {
+			u64 delta = now - tctx->last_run_at;
+			tctx->cpu_window_runtime += delta;
+		}
+
+		/* Check if window has elapsed */
+		u64 window_elapsed = now - tctx->cpu_window_start;
+		if (window_elapsed >= hog_cpu_window_ns) {
+			/* Calculate CPU percentage for completed window */
+			u64 cpu_percent = (tctx->cpu_window_runtime * 100) /
+					  window_elapsed;
+
+			/* Check if exceeds threshold */
+			if (cpu_percent > hog_cpu_threshold) {
+				tctx->demote_to_hog = true;
+				if (debug)
+					bpf_printk(
+						"Task %d CPU %llu%% exceeds %d%%, demoting to HOG",
+						p->pid, cpu_percent,
+						hog_cpu_threshold);
+			}
+
+			/* Reset window */
+			tctx->cpu_window_start	 = now;
+			tctx->cpu_window_runtime = 0;
+		}
+	}
 }
 
 void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
@@ -630,6 +721,12 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 
 	tctx->last_run_at = bpf_ktime_get_ns();
 
+	/* Track migrations */
+	s32 cpu = scx_bpf_task_cpu(p);
+	if (tctx->last_cpu >= 0 && tctx->last_cpu != cpu)
+		__sync_fetch_and_add(&nr_migrations, 1);
+	tctx->last_cpu = cpu;
+
 	/* Update CPU context */
 	cpuc = bpf_map_lookup_elem(&cpu_ctx_stor, &zero_u32);
 	if (cpuc) {
@@ -638,7 +735,6 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 
 	/* CPU frequency scaling if enabled */
 	if (cpufreq_enabled) {
-		s32 cpu	 = scx_bpf_task_cpu(p);
 		u32 perf = SCX_CPUPERF_ONE;
 
 		switch (tctx->queue) {
@@ -668,6 +764,10 @@ void BPF_STRUCT_OPS(happy_stopping, struct task_struct *p, bool runnable)
 	tctx = lookup_task_ctx(p);
 	if (!tctx)
 		return;
+
+	/* Count preemptions (task still runnable but being stopped) */
+	if (runnable)
+		__sync_fetch_and_add(&nr_preemptions, 1);
 
 	/* Update runtime */
 	delta		   = now - tctx->last_run_at;
