@@ -111,6 +111,32 @@ impl TaskClassifier {
         self.detect_audio_tasks();
     }
 
+    /// Detect all tasks and return true if any changes were detected
+    fn detect_all_with_changes(&mut self) -> bool {
+        // Store old state before clearing
+        let old_scx_turbo = self.scx_turbo_tgids.clone();
+        let old_steam = self.steam_tgids.clone();
+        let old_de = self.de_tgids.clone();
+        let old_input = self.input_tgids.clone();
+        let old_audio = self.audio_tgids.clone();
+
+        // Run detection (this clears and rebuilds all sets)
+        self.detect_all();
+
+        // Check if anything changed
+        let changed = old_scx_turbo != self.scx_turbo_tgids
+            || old_steam != self.steam_tgids
+            || old_de != self.de_tgids
+            || old_input != self.input_tgids
+            || old_audio != self.audio_tgids;
+
+        if changed {
+            debug!("Task classification changes detected");
+        }
+
+        changed
+    }
+
     fn detect_scx_turbo(&mut self) {
         self.scx_turbo_tgids.clear();
 
@@ -525,12 +551,12 @@ fn main() -> Result<()> {
 
     // Main loop
     while !should_exit.load(Ordering::Relaxed) {
-        // Periodic task classification
+        // Periodic task classification - only print on changes
         if last_poll.elapsed() >= poll_interval {
             debug!("Running task classification...");
-            classifier.detect_all();
 
-            if opts.verbose {
+            if classifier.detect_all_with_changes() {
+                // Something changed - print stats
                 classifier.print_stats();
             }
 
