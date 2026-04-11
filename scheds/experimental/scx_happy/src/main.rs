@@ -80,6 +80,10 @@ struct Opts {
     #[clap(short, long)]
     verbose: bool,
 
+    /// Print scheduler stats every N seconds
+    #[clap(long, value_name = "SECONDS")]
+    stats: Option<u64>,
+
     #[clap(flatten)]
     libbpf: LibbpfOpts,
 }
@@ -425,6 +429,21 @@ fn set_domain_cpu(skel: &mut BpfSkel, cpu: i32, queue: u32) -> Result<()> {
     Ok(())
 }
 
+/// Print scheduler statistics
+fn print_scheduler_stats(_skel: &BpfSkel, classifier: &TaskClassifier) {
+    // For now, print classification stats only
+    // TODO: Add BPF map stats reading when properly configured
+    info!("=== Scheduler Stats ===");
+    info!(
+        "Active classified tasks: SCX_TURBO={}, Steam={}, DE={}, Input={}, Audio={}",
+        classifier.scx_turbo_tgids.len(),
+        classifier.steam_tgids.len(),
+        classifier.de_tgids.len(),
+        classifier.input_tgids.len(),
+        classifier.audio_tgids.len()
+    );
+}
+
 fn init_domain(skel: &mut BpfSkel, domain: &str, topo: &Topology, queue: u32) -> Result<()> {
     let mut cpumask = Cpumask::new();
 
@@ -545,9 +564,18 @@ fn main() -> Result<()> {
     let poll_interval = Duration::from_millis(opts.tgid_poll_ms);
     let mut last_poll = Instant::now();
 
+    // Stats interval setup
+    let stats_interval = opts.stats.map(Duration::from_secs);
+    let mut last_stats = Instant::now();
+
     // Run initial classification
     classifier.detect_all();
     classifier.print_stats();
+
+    // Print initial scheduler stats if --stats is enabled
+    if stats_interval.is_some() {
+        print_scheduler_stats(&skel, &classifier);
+    }
 
     // Main loop
     while !should_exit.load(Ordering::Relaxed) {
@@ -561,6 +589,14 @@ fn main() -> Result<()> {
             }
 
             last_poll = Instant::now();
+        }
+
+        // Periodic scheduler stats printing
+        if let Some(interval) = stats_interval {
+            if last_stats.elapsed() >= interval {
+                print_scheduler_stats(&skel, &classifier);
+                last_stats = Instant::now();
+            }
         }
 
         // Check for scheduler exit
