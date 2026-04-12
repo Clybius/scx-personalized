@@ -88,13 +88,6 @@ struct happy_stats {
 	u64 hog_avg_vtime; /* HOG queue weighted avg vtime */
 };
 
-/* Per-queue configuration */
-struct happy_queue_config {
-	u64 slice_ns;
-	u64 slice_lag_ns;
-	u32 preempts_queues; /* Bitmask of queues this queue preempts */
-};
-
 /* Domain configuration flags */
 #define HAPPY_DOMAIN_TURBO 0
 #define HAPPY_DOMAIN_PERFORMANCE 1

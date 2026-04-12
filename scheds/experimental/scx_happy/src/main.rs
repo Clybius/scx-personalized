@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Result};
 use clap::Parser;
+use libbpf_rs::MapCore as _;
 use log::{debug, info};
 use scx_utils::{
     libbpf_clap_opts::LibbpfOpts, scx_ops_attach, scx_ops_load, scx_ops_open,
@@ -305,7 +306,25 @@ impl TaskClassifier {
     fn detect_input_tasks(&mut self) {
         self.input_tgids.clear();
 
-        let input_patterns = ["input-", "evdev", "libinput", "keyboard", "mouse"];
+        // Input event handling threads (distinct from DE/compositors)
+        // These handle actual mouse & keyboard events at a low level
+        let input_patterns = [
+            // Input method editors (IMEs) - handle keyboard input transformation
+            "fcitx",
+            "fcitx5",
+            "ibus",
+            "ibus-daemon",
+            "ibus-engine",
+            // ksoftirqd handles input interrupts among other softirq processing
+            "ksoftirqd",
+            // Direct input event handling threads (may exist in some setups)
+            "input-events",
+            "input-thread",
+            "input-worker",
+            // Evdev handling patterns
+            "evdev-process",
+            "evdev-worker",
+        ];
 
         let entries = match fs::read_dir("/proc") {
             Ok(e) => e,
@@ -391,6 +410,60 @@ impl TaskClassifier {
         info!("  DE components: {}", self.de_tgids.len());
         info!("  Input tasks: {}", self.input_tgids.len());
         info!("  Audio tasks: {}", self.audio_tgids.len());
+    }
+
+    /// Write classified TGIDs to BPF maps
+    fn update_bpf_maps(&self, skel: &mut BpfSkel) -> Result<()> {
+        use libbpf_rs::MapFlags;
+
+        // Update all classification maps
+        for &tgid in &self.input_tgids {
+            let val: u8 = 1;
+            skel.maps
+                .input_tgids
+                .update(&tgid.to_ne_bytes(), &val.to_ne_bytes(), MapFlags::ANY)?;
+        }
+
+        for &tgid in &self.steam_tgids {
+            let val: u8 = 1;
+            skel.maps
+                .steam_tgids
+                .update(&tgid.to_ne_bytes(), &val.to_ne_bytes(), MapFlags::ANY)?;
+        }
+
+        for &tgid in &self.de_tgids {
+            let val: u8 = 1;
+            skel.maps
+                .de_tgids
+                .update(&tgid.to_ne_bytes(), &val.to_ne_bytes(), MapFlags::ANY)?;
+        }
+
+        for &tgid in &self.audio_tgids {
+            let val: u8 = 1;
+            skel.maps
+                .audio_tgids
+                .update(&tgid.to_ne_bytes(), &val.to_ne_bytes(), MapFlags::ANY)?;
+        }
+
+        for &tgid in &self.scx_turbo_tgids {
+            let val: u8 = 1;
+            skel.maps.scx_turbo_tgids.update(
+                &tgid.to_ne_bytes(),
+                &val.to_ne_bytes(),
+                MapFlags::ANY,
+            )?;
+        }
+
+        debug!(
+            "Updated BPF maps: {} input, {} steam, {} de, {} audio, {} turbo",
+            self.input_tgids.len(),
+            self.steam_tgids.len(),
+            self.de_tgids.len(),
+            self.audio_tgids.len(),
+            self.scx_turbo_tgids.len()
+        );
+
+        Ok(())
     }
 }
 
@@ -578,9 +651,6 @@ fn main() -> Result<()> {
     rodata.lc_slice_ns = opts.lc_slice_us * 1000;
     rodata.normal_slice_ns = opts.normal_slice_us * 1000;
     rodata.hog_slice_ns = opts.hog_slice_us * 1000;
-    rodata.lc_slice_lag_ns = opts.lc_slice_us * 1000 * 20; // 20x slice
-    rodata.normal_slice_lag_ns = opts.normal_slice_us * 1000 * 20;
-    rodata.hog_slice_lag_ns = opts.hog_slice_us * 1000 * 20;
     rodata.avoid_smt = !opts.disable_smt_avoid;
     rodata.cache_affinity = !opts.disable_cache_affinity;
     rodata.cpufreq_enabled = !opts.disable_cpufreq;
@@ -619,6 +689,11 @@ fn main() -> Result<()> {
     classifier.detect_all();
     classifier.print_stats();
 
+    // Update BPF maps with detected TGIDs
+    if let Err(e) = classifier.update_bpf_maps(&mut skel) {
+        debug!("Failed to update BPF maps: {}", e);
+    }
+
     // Print initial scheduler stats if --stats is enabled
     if stats_interval.is_some() {
         print_scheduler_stats(&skel, &classifier);
@@ -631,8 +706,11 @@ fn main() -> Result<()> {
             debug!("Running task classification...");
 
             if classifier.detect_all_with_changes() {
-                // Something changed - print stats
+                // Something changed - print stats and update BPF maps
                 classifier.print_stats();
+                if let Err(e) = classifier.update_bpf_maps(&mut skel) {
+                    debug!("Failed to update BPF maps: {}", e);
+                }
             }
 
             last_poll = Instant::now();

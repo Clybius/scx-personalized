@@ -40,12 +40,9 @@ UEI_DEFINE(uei);
 #define SHARED_DSQ 3
 
 /* Queue configuration - can be overridden from userspace */
-const volatile u64 lc_slice_ns	       = 500000; /* 500us */
-const volatile u64 lc_slice_lag_ns     = 10000000; /* 10000us */
-const volatile u64 normal_slice_ns     = 1000000; /* 1000us */
-const volatile u64 normal_slice_lag_ns = 20000000; /* 20000us */
-const volatile u64 hog_slice_ns	       = 3000000; /* 3000us */
-const volatile u64 hog_slice_lag_ns    = 60000000; /* 60000us */
+const volatile u64 lc_slice_ns	   = 500000; /* 500us */
+const volatile u64 normal_slice_ns = 1000000; /* 1000us */
+const volatile u64 hog_slice_ns	   = 3000000; /* 3000us */
 
 /* Feature toggles */
 const volatile bool avoid_smt	      = true;
@@ -712,21 +709,6 @@ static inline void update_eevdf_state(struct task_ctx *tctx,
 
 	/* Eligibility starts at current vtime (eligible immediately after sleep) */
 	tctx->eligible_vtime = tctx->vtime;
-}
-
-/* Get slice lag for queue */
-static inline u64 get_lag_for_queue(enum happy_queue queue)
-{
-	switch (queue) {
-	case HAPPY_QUEUE_LC:
-		return lc_slice_lag_ns;
-	case HAPPY_QUEUE_NORMAL:
-		return normal_slice_lag_ns;
-	case HAPPY_QUEUE_HOG:
-		return hog_slice_lag_ns;
-	default:
-		return normal_slice_lag_ns;
-	}
 }
 
 /* Init task - called when task is first seen by scheduler */
