@@ -94,10 +94,15 @@ volatile u64 nr_antistall_dispatches;
 volatile u64 nr_smt_avoided;
 volatile u64 nr_classified_tasks;
 /* NEW: Dynamic adjustment statistics */
-volatile u64	   nr_dynamic_adjustments;
-volatile u64	   nr_interactive_detected;
-volatile u64	   nr_promotions;
-volatile u64	   nr_demotions;
+volatile u64 nr_dynamic_adjustments;
+volatile u64 nr_interactive_detected;
+volatile u64 nr_promotions;
+volatile u64 nr_demotions;
+
+/* NEW: EEVDF statistics counters */
+volatile u64	   nr_eligible_dispatches;
+volatile u64	   nr_ineligible_dispatches;
+volatile u64	   nr_deadline_expired;
 
 const volatile u32 debug    = 0;
 const u32	   zero_u32 = 0;
@@ -130,6 +135,12 @@ struct task_ctx {
 	s16 target_virt_nice; /* Calculated target (smoothed toward this) */
 	u32 dynamic_score; /* Raw 0-1000 score before normalization */
 	u64 last_recalc_ns; /* When we last recalculated */
+
+	/* NEW: EEVDF/WFQ fields */
+	u64 eligible_vtime; /* When task becomes eligible */
+	u64 deadline_vtime; /* Virtual deadline */
+	u64 weight; /* WFQ weight based on virt_nice */
+	u64 vslice; /* Virtual slice = slice * NICE_0_WEIGHT / weight */
 };
 
 /* Per-task storage map */
@@ -204,6 +215,21 @@ struct {
 	__type(key, u32);
 	__type(value, s32); /* Sibling CPU or -1 */
 } smt_sibling_map SEC(".maps");
+
+/* Per-queue EEVDF state - stored in BPF map for mutable global state */
+struct queue_eevdf_state {
+	u64 min_vtime; /* Minimum vtime in queue */
+	u64 avg_vtime; /* Weighted sum for avg calculation */
+	u64 total_weight; /* Sum of weights of running tasks */
+	u32 nr_tasks; /* Number of active tasks */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, HAPPY_QUEUE_MAX); /* 3 entries: LC, NORMAL, HOG */
+	__type(key, u32); /* queue index */
+	__type(value, struct queue_eevdf_state);
+} queue_eevdf_states SEC(".maps");
 
 /* Global vtime clock */
 static u64 vtime_now;
@@ -317,16 +343,101 @@ static inline s32 prio_to_nice(s32 static_prio)
 	return static_prio - 120;
 }
 
-/* Helper: calculate vtime scaling factor from virt_nice */
-static inline u64 calc_vtime_scale(s16 virt_nice)
+/* Linux kernel nice-to-weight table for nice -20 to 19 */
+/* NICE_0_WEIGHT = 1024 */
+static const u32 nice_to_weight[40] = {
+	/* nice -20 to -16 */ 88761,
+	71755,
+	56483,
+	46273,
+	36291,
+	/* nice -15 to -11 */ 29154,
+	23254,
+	18705,
+	14949,
+	11916,
+	/* nice -10 to -6  */ 9548,
+	7620,
+	6100,
+	4904,
+	3906,
+	/* nice -5 to -1   */ 3121,
+	2501,
+	1991,
+	1586,
+	1277,
+	/* nice 0 to 4     */ 1024,
+	820,
+	655,
+	526,
+	423,
+	/* nice 5 to 9     */ 335,
+	272,
+	215,
+	172,
+	137,
+	/* nice 10 to 14   */ 110,
+	87,
+	70,
+	56,
+	45,
+	/* nice 15 to 19   */ 36,
+	29,
+	23,
+	18,
+	15
+};
+
+#define NICE_0_WEIGHT 1024
+
+/* Convert virtual nice (-50..49) to WFQ weight */
+static inline u64 calc_weight_from_virt_nice(s16 virt_nice)
 {
-	/* virt_nice: -50 to 49, scale = 100 + virt_nice = 50 to 149 */
-	s64 scale = 100 + virt_nice;
-	if (scale < 50)
-		scale = 50;
-	if (scale > 149)
-		scale = 149;
-	return (u64)scale;
+	/* Map virt_nice to kernel nice (-20..19) then to weight */
+	s32 kernel_nice = ((virt_nice + 50) * 39) / 99 - 20;
+
+	if (kernel_nice < -20)
+		kernel_nice = -20;
+	if (kernel_nice > 19)
+		kernel_nice = 19;
+
+	return (u64)nice_to_weight[kernel_nice + 20];
+}
+
+/* Calculate virtual slice: vslice = slice * NICE_0_WEIGHT / weight */
+static inline u64 calc_vslice(u64 slice_ns, u64 weight)
+{
+	if (weight == 0)
+		return slice_ns; /* Fallback: no weight scaling */
+	return slice_ns * NICE_0_WEIGHT / weight;
+}
+
+/* Calculate virtual deadline: vd = vruntime + vslice */
+static inline u64 calc_deadline(u64 vtime, u64 vslice)
+{
+	return vtime + vslice;
+}
+
+/* Check if task is eligible to run (lag >= 0) */
+/* A task is eligible when its vruntime <= weighted average vtime */
+static inline bool is_eligible(struct task_ctx *tctx, enum happy_queue queue)
+{
+	struct queue_eevdf_state *state;
+	u32			  key = (u32)queue;
+	u64			  avg_vtime;
+
+	state = bpf_map_lookup_elem(&queue_eevdf_states, &key);
+	if (!state)
+		return true; /* Default to eligible if lookup fails */
+
+	/* Calculate weighted average vtime */
+	avg_vtime = state->min_vtime;
+	if (state->total_weight > 0) {
+		avg_vtime += state->avg_vtime / state->total_weight;
+	}
+
+	/* Eligible if vruntime <= avg_vtime (task is owed CPU time) */
+	return tctx->vtime <= avg_vtime;
 }
 
 /* Calculate EWMA frequency: freq = alpha * (1/interval) + (1-alpha) * freq */
@@ -582,6 +693,27 @@ static inline u64 get_slice_for_queue(enum happy_queue queue)
 	}
 }
 
+/* Update task's EEVDF state on enqueue */
+static inline void update_eevdf_state(struct task_ctx *tctx,
+				      enum happy_queue queue)
+{
+	u64 slice = get_slice_for_queue(queue);
+
+	/* Get or calculate weight */
+	if (tctx->weight == 0) {
+		tctx->weight = calc_weight_from_virt_nice(tctx->virt_nice);
+	}
+
+	/* Calculate virtual slice: time charged per unit of real time */
+	tctx->vslice = calc_vslice(slice, tctx->weight);
+
+	/* Calculate deadline: when this slice should complete */
+	tctx->deadline_vtime = calc_deadline(tctx->vtime, tctx->vslice);
+
+	/* Eligibility starts at current vtime (eligible immediately after sleep) */
+	tctx->eligible_vtime = tctx->vtime;
+}
+
 /* Get slice lag for queue */
 static inline u64 get_lag_for_queue(enum happy_queue queue)
 {
@@ -628,6 +760,12 @@ static void init_task(struct task_struct *p, struct task_ctx *tctx)
 	tctx->target_virt_nice	= tctx->virt_nice;
 	tctx->dynamic_score	= 500; /* Start neutral */
 	tctx->last_recalc_ns	= now;
+
+	/* NEW: Initialize EEVDF/WFQ fields */
+	tctx->eligible_vtime = vtime_now;
+	tctx->deadline_vtime = vtime_now;
+	tctx->weight	     = calc_weight_from_virt_nice(tctx->virt_nice);
+	tctx->vslice	     = 0;
 
 	/* Count classified tasks (non-default queue) */
 	if (tctx->queue != HAPPY_QUEUE_NORMAL)
@@ -786,10 +924,11 @@ s32 BPF_STRUCT_OPS(happy_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
-	u64		 dsq_id, slice, vtime;
+	u64		 dsq_id, slice, vtime_for_dsq;
 	u32		 llc_id = 0; /* Simplified: always use LLC 0 for now */
+	bool		 eligible;
 
-	tctx			= lookup_task_ctx(p);
+	tctx = lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
@@ -798,25 +937,45 @@ void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->queue	    = HAPPY_QUEUE_HOG;
 		tctx->virt_nice	    = HAPPY_VIRT_NICE_HOG;
 		tctx->demote_to_hog = false;
+		/* Reset weight for new queue */
+		tctx->weight = calc_weight_from_virt_nice(tctx->virt_nice);
 		if (debug)
 			bpf_printk("Task %d demoted to HOG queue", p->pid);
 	}
 
-	/* Update vtime */
-	u64 vtime_min = vtime_now - get_lag_for_queue(tctx->queue);
-	if (tctx->vtime < vtime_min)
-		tctx->vtime = vtime_min;
+	/* Update EEVDF state (weight, vslice, deadline) */
+	update_eevdf_state(tctx, tctx->queue);
 
-	/* Calculate scaled vtime */
-	u64 scale = calc_vtime_scale(tctx->virt_nice);
-	vtime	  = tctx->vtime + (tctx->exec_runtime * scale / 100);
+	/* Check eligibility - is task owed CPU time? */
+	eligible = is_eligible(tctx, tctx->queue);
+
+	/*
+	 * EEVDF dispatch ordering:
+	 * - Eligible tasks: order by deadline (earliest deadline first)
+	 * - Ineligible tasks: order by vruntime (fairness catch-up)
+	 */
+	if (eligible) {
+		/* Use deadline for ordering among eligible tasks */
+		vtime_for_dsq = tctx->deadline_vtime;
+		__sync_fetch_and_add(&nr_eligible_dispatches, 1);
+		if (debug)
+			bpf_printk("Task %d eligible, deadline=%llu", p->pid,
+				   vtime_for_dsq);
+	} else {
+		/* Not eligible - use vruntime for fairness ordering */
+		vtime_for_dsq = tctx->vtime;
+		__sync_fetch_and_add(&nr_ineligible_dispatches, 1);
+		if (debug)
+			bpf_printk("Task %d NOT eligible, vtime=%llu", p->pid,
+				   vtime_for_dsq);
+	}
 
 	/* Get queue configuration */
 	dsq_id = get_dsq_for_queue(tctx->queue, llc_id);
 	slice  = get_slice_for_queue(tctx->queue);
 
-	/* Insert into queue with vtime */
-	scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime, enq_flags);
+	/* Insert with appropriate vtime (deadline or vruntime) */
+	scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime_for_dsq, enq_flags);
 
 	/* Update antistall tracking if enabled */
 	if (antistall_enabled) {
@@ -971,6 +1130,19 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 		scx_bpf_cpuperf_set(cpu, perf);
 	}
 
+	/* NEW: Update queue EEVDF state - task is now running */
+	u32			  key = (u32)tctx->queue;
+	struct queue_eevdf_state *state =
+		bpf_map_lookup_elem(&queue_eevdf_states, &key);
+	if (state) {
+		if (tctx->weight == 0)
+			tctx->weight =
+				calc_weight_from_virt_nice(tctx->virt_nice);
+
+		state->total_weight += tctx->weight;
+		state->nr_tasks++;
+	}
+
 	/* NEW: Update average runtime from previous execution */
 	if (tctx->exec_runtime > 0) {
 		/* EWMA of runtime: new = (old * 3 + new) / 4 */
@@ -994,6 +1166,7 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 			/* Apply change if different */
 			if (new_nice != tctx->virt_nice) {
 				enum happy_queue new_queue;
+				u64		 old_weight = tctx->weight;
 
 				/* Determine new queue */
 				if (new_nice <= HAPPY_LC_MAX_VIRT_NICE)
@@ -1003,11 +1176,41 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 				else
 					new_queue = HAPPY_QUEUE_HOG;
 
-				/* Apply change */
+				/* Remove from old queue state */
+				if (tctx->queue < HAPPY_QUEUE_MAX &&
+				    old_weight > 0) {
+					u32 old_key = (u32)tctx->queue;
+					struct queue_eevdf_state *old_state =
+						bpf_map_lookup_elem(
+							&queue_eevdf_states,
+							&old_key);
+					if (old_state) {
+						if (old_state->total_weight >=
+						    old_weight)
+							old_state->total_weight -=
+								old_weight;
+						if (old_state->nr_tasks > 0)
+							old_state->nr_tasks--;
+					}
+				}
+
+				/* Apply new nice and recalculate weight */
 				enum happy_queue old_queue = tctx->queue;
 				tctx->virt_nice		   = new_nice;
 				tctx->queue		   = new_queue;
-				tctx->last_recalc_ns	   = now;
+				tctx->weight =
+					calc_weight_from_virt_nice(new_nice);
+				tctx->last_recalc_ns = now;
+
+				/* Add to new queue state */
+				u32 new_key = (u32)new_queue;
+				struct queue_eevdf_state *new_state =
+					bpf_map_lookup_elem(&queue_eevdf_states,
+							    &new_key);
+				if (new_state) {
+					new_state->total_weight += tctx->weight;
+					new_state->nr_tasks++;
+				}
 
 				/* Count statistics */
 				__sync_fetch_and_add(&nr_dynamic_adjustments,
@@ -1015,17 +1218,17 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 				if (tctx->dynamic_score > interactive_threshold)
 					__sync_fetch_and_add(
 						&nr_interactive_detected, 1);
-				if (new_queue <
-				    old_queue) /* Better queue = lower enum value */
+				if (new_queue < old_queue)
 					__sync_fetch_and_add(&nr_promotions, 1);
 				else if (new_queue > old_queue)
 					__sync_fetch_and_add(&nr_demotions, 1);
 
 				if (debug)
 					bpf_printk(
-						"Task %d: virt_nice -> %d (score %u)",
+						"Task %d: virt_nice -> %d (score %u, weight %llu)",
 						p->pid, new_nice,
-						tctx->dynamic_score);
+						tctx->dynamic_score,
+						tctx->weight);
 			}
 		}
 	}
@@ -1036,6 +1239,7 @@ void BPF_STRUCT_OPS(happy_stopping, struct task_struct *p, bool runnable)
 	struct task_ctx *tctx;
 	u64		 now = bpf_ktime_get_ns();
 	u64		 delta;
+	u64		 vdelta;
 
 	tctx = lookup_task_ctx(p);
 	if (!tctx)
@@ -1049,13 +1253,32 @@ void BPF_STRUCT_OPS(happy_stopping, struct task_struct *p, bool runnable)
 	delta		   = now - tctx->last_run_at;
 	tctx->exec_runtime = delta;
 
-	/* Update vtime with scaling */
-	u64 scale = calc_vtime_scale(tctx->virt_nice);
-	tctx->vtime += (delta * scale / 100);
+	/* NEW: WFQ-style vtime update - vruntime += delta * NICE_0_WEIGHT / weight */
+	if (tctx->weight == 0)
+		tctx->weight = calc_weight_from_virt_nice(tctx->virt_nice);
 
-	/* Advance global vtime if needed */
-	if (tctx->vtime > vtime_now)
-		vtime_now = tctx->vtime;
+	vdelta = delta * NICE_0_WEIGHT / tctx->weight;
+	tctx->vtime += vdelta;
+
+	/* Update queue EEVDF state - task is no longer running */
+	u32			  key = (u32)tctx->queue;
+	struct queue_eevdf_state *state =
+		bpf_map_lookup_elem(&queue_eevdf_states, &key);
+	if (state) {
+		/* Update min_vtime if this is the new minimum */
+		if (tctx->vtime < state->min_vtime || state->min_vtime == 0) {
+			state->min_vtime = tctx->vtime;
+		}
+
+		/* Update weighted average accumulator */
+		state->avg_vtime += vdelta * tctx->weight;
+
+		/* Remove task from running count */
+		if (state->total_weight >= tctx->weight)
+			state->total_weight -= tctx->weight;
+		if (state->nr_tasks > 0)
+			state->nr_tasks--;
+	}
 }
 
 void BPF_STRUCT_OPS(happy_set_weight, struct task_struct *p, u32 weight)

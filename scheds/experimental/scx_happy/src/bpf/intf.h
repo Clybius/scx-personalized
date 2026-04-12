@@ -75,6 +75,17 @@ struct happy_stats {
 	u64 nr_interactive_detected; /* Tasks detected as interactive */
 	u64 nr_promotions; /* Tasks promoted to better queue */
 	u64 nr_demotions; /* Tasks demoted to worse queue */
+	/* NEW: EEVDF/WFQ statistics */
+	u64 nr_eligible_dispatches; /* Dispatched as eligible */
+	u64 nr_ineligible_dispatches; /* Dispatched as ineligible */
+	u64 nr_deadline_expired; /* Tasks that exceeded deadline */
+	/* Per-queue vtime tracking */
+	u64 lc_min_vtime; /* LC queue min vtime */
+	u64 lc_avg_vtime; /* LC queue weighted avg vtime */
+	u64 normal_min_vtime; /* NORMAL queue min vtime */
+	u64 normal_avg_vtime; /* NORMAL queue weighted avg vtime */
+	u64 hog_min_vtime; /* HOG queue min vtime */
+	u64 hog_avg_vtime; /* HOG queue weighted avg vtime */
 };
 
 /* Per-queue configuration */
