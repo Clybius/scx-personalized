@@ -58,28 +58,56 @@ const volatile u64  antistall_sec     = 3;
 const volatile u8  hog_cpu_threshold = 50; /* Default 50% CPU threshold */
 const volatile u64 hog_cpu_window_ns = 100000000; /* 100ms measurement window */
 
+/* Dynamic virtual nice adjustment parameters */
+const volatile bool dynamic_nice_enabled   = true;
+const volatile u64  adjust_interval_ns	   = 10000000; /* 10ms default */
+const volatile s16  lc_virt_nice_boost	   = 15; /* Boost within LC range */
+const volatile s16  normal_virt_nice_boost = 15; /* Boost within NORMAL range */
+const volatile s16  hog_virt_nice_penalty  = 10; /* Penalty within HOG range */
+const volatile u32  interactive_threshold  = 700; /* Score >700 = interactive */
+
+/* Dynamic adjustment flags */
+#define HAPPY_FLAG_IS_SYNC_WAKEUP 0x00000001 /* Woken via sync wakeup */
+#define HAPPY_FLAG_IS_WAKEUP 0x00000002 /* Recently woken */
+#define HAPPY_FLAG_WOKEN_BY_IRQ 0x00000004 /* Woken by IRQ handler */
+#define HAPPY_FLAG_IS_GREEDY 0x00000008 /* Using more than fair share */
+#define HAPPY_FLAG_IS_INTERACTIVE 0x00000010 /* Detected interactive pattern */
+#define HAPPY_FLAG_DYNAMIC_ADJUST 0x00000020 /* Subject to dynamic adjustment */
+
+#define HAPPY_ADJUST_INTERVAL_NS 10000000 /* Recalculate every 10ms */
+#define HAPPY_FREQ_MAX 100000 /* Max frequency cap (100K/sec) */
+#define HAPPY_RUNTIME_LC_THRESH_NS 1000000 /* <1ms runtime = very interactive */
+#define HAPPY_RUNTIME_NORMAL_THRESH_NS 5000000 /* <5ms = interactive */
+
 /* Domain cpumask storage - global variables with __kptr */
 private(HAPPY) struct bpf_cpumask __kptr *lc_cpumask;
 private(HAPPY) struct bpf_cpumask __kptr *normal_cpumask;
 private(HAPPY) struct bpf_cpumask __kptr *hog_cpumask;
 
 /* Scheduling statistics - in BSS section, exposed to userspace */
-volatile u64	   nr_lc_dispatches;
-volatile u64	   nr_normal_dispatches;
-volatile u64	   nr_hog_dispatches;
-volatile u64	   nr_preemptions;
-volatile u64	   nr_migrations;
-volatile u64	   nr_antistall_dispatches;
-volatile u64	   nr_smt_avoided;
-volatile u64	   nr_classified_tasks;
+volatile u64 nr_lc_dispatches;
+volatile u64 nr_normal_dispatches;
+volatile u64 nr_hog_dispatches;
+volatile u64 nr_preemptions;
+volatile u64 nr_migrations;
+volatile u64 nr_antistall_dispatches;
+volatile u64 nr_smt_avoided;
+volatile u64 nr_classified_tasks;
+/* NEW: Dynamic adjustment statistics */
+volatile u64	   nr_dynamic_adjustments;
+volatile u64	   nr_interactive_detected;
+volatile u64	   nr_promotions;
+volatile u64	   nr_demotions;
 
 const volatile u32 debug    = 0;
 const u32	   zero_u32 = 0;
 
 /* Task context stored in task storage map */
 struct task_ctx {
-	s16		 virt_nice; /* Virtual nice: -50 to 49 */
+	s16 virt_nice; /* Virtual nice: -50 to 49 */
+	s16 base_virt_nice; /* Original/static virt_nice from classification */
 	enum happy_queue queue; /* Assigned queue */
+	enum happy_queue base_queue; /* Original queue from classification */
 	u64		 last_run_at;
 	u64		 exec_runtime;
 	u64		 vtime; /* Virtual runtime */
@@ -89,6 +117,19 @@ struct task_ctx {
 	u64  cpu_window_start; /* Start of current measurement window */
 	u64  cpu_window_runtime; /* Cumulative runtime in current window */
 	bool demote_to_hog; /* Flag: should be demoted on next enqueue */
+
+	/* NEW: Behavioral tracking for dynamic adjustment */
+	u64 wait_freq; /* How often task sleeps (waits) */
+	u64 wake_freq; /* How often task wakes others */
+	u64 avg_runtime_ns; /* Average runtime per schedule */
+	u64 last_runnable_ns; /* Timestamp when became runnable */
+	u64 last_quiescent_ns; /* Timestamp when went to sleep */
+	u32 flags; /* HAPPY_FLAG_* indicators */
+
+	/* NEW: Dynamic adjustment state */
+	s16 target_virt_nice; /* Calculated target (smoothed toward this) */
+	u32 dynamic_score; /* Raw 0-1000 score before normalization */
+	u64 last_recalc_ns; /* When we last recalculated */
 };
 
 /* Per-task storage map */
@@ -288,6 +329,34 @@ static inline u64 calc_vtime_scale(s16 virt_nice)
 	return (u64)scale;
 }
 
+/* Calculate EWMA frequency: freq = alpha * (1/interval) + (1-alpha) * freq */
+static inline u64 calc_avg_freq(u64 curr_freq, u64 interval_ns)
+{
+	/* Using fixed-point arithmetic: EWMA with 1/4 decay */
+	u64 new_freq;
+
+	if (interval_ns == 0)
+		return curr_freq;
+
+	/* Prevent division by zero and extreme values */
+	if (interval_ns < 1000) /* <1us, assume 1us */
+		interval_ns = 1000;
+
+	new_freq = 1000000000ULL / interval_ns; /* Frequency in Hz */
+
+	/* EWMA: new = (old * 3 + new) / 4 */
+	if (curr_freq == 0)
+		return new_freq;
+
+	return ((curr_freq * 3) + new_freq) / 4;
+}
+
+/* Calculate absolute value for s16 */
+static inline s16 abs_s16(s16 x)
+{
+	return x < 0 ? -x : x;
+}
+
 /* Helper: map existing nice to virtual nice range */
 static inline s16 map_nice_to_virt(s32 nice)
 {
@@ -369,6 +438,129 @@ static enum happy_queue classify_task(struct task_struct *p,
 		return HAPPY_QUEUE_HOG;
 }
 
+/* Calculate raw interactive score (0-1000) based on behavioral metrics */
+static u32 calc_interactive_score(struct task_struct *p, struct task_ctx *tctx)
+{
+	u32 score = 500; /* Start at neutral */
+	u32 freq_factor, runtime_factor;
+
+	/* Factor 1: Wait frequency (higher = more interactive) */
+	/* wait_freq measures sleeps/sec. High = waiting for I/O, input, etc. */
+	freq_factor = (u32)(tctx->wait_freq < HAPPY_FREQ_MAX ? tctx->wait_freq :
+							       HAPPY_FREQ_MAX);
+	score += (freq_factor * 200) / HAPPY_FREQ_MAX; /* +0 to +200 */
+
+	/* Factor 2: Runtime inverse (shorter = more interactive) */
+	if (tctx->avg_runtime_ns < HAPPY_RUNTIME_LC_THRESH_NS)
+		runtime_factor = 200; /* Very short = max bonus */
+	else if (tctx->avg_runtime_ns < HAPPY_RUNTIME_NORMAL_THRESH_NS)
+		runtime_factor = 100; /* Short = moderate bonus */
+	else if (tctx->avg_runtime_ns < 20000000) /* 20ms */
+		runtime_factor = 0; /* Normal */
+	else
+		runtime_factor = -100; /* Long runtime = penalty */
+	score += runtime_factor;
+
+	/* Factor 3: Context flags */
+	if (tctx->flags & HAPPY_FLAG_IS_SYNC_WAKEUP)
+		score +=
+			50; /* Sync wakeups indicate producer-consumer chains */
+	if (tctx->flags & HAPPY_FLAG_WOKEN_BY_IRQ)
+		score += 100; /* IRQ-driven tasks are usually interactive */
+	if (p->flags & PF_KTHREAD)
+		score += 25; /* Kernel threads slightly boosted */
+
+	/* Factor 4: Wake frequency (producer indicator) */
+	freq_factor = (u32)(tctx->wake_freq < HAPPY_FREQ_MAX ? tctx->wake_freq :
+							       HAPPY_FREQ_MAX);
+	score += (freq_factor * 100) / HAPPY_FREQ_MAX; /* +0 to +100 */
+
+	/* Clamp to valid range */
+	if (score > 1000)
+		score = 1000;
+
+	return score;
+}
+
+/* Calculate target virt_nice within the task's base queue boundaries */
+static s16 calc_dynamic_virt_nice(struct task_struct *p, struct task_ctx *tctx)
+{
+	u32 score;
+	s16 base = tctx->base_virt_nice;
+	s16 min_nice, max_nice, target;
+	s16 range;
+
+	/* Get queue boundaries */
+	switch (tctx->base_queue) {
+	case HAPPY_QUEUE_LC:
+		min_nice = HAPPY_LC_MIN_VIRT_NICE; /* -50 */
+		max_nice = HAPPY_LC_MAX_VIRT_NICE; /* -20 */
+		break;
+	case HAPPY_QUEUE_NORMAL:
+		min_nice = HAPPY_NORMAL_MIN_VIRT_NICE; /* -19 */
+		max_nice = HAPPY_NORMAL_MAX_VIRT_NICE; /* 10 */
+		break;
+	case HAPPY_QUEUE_HOG:
+		/* HOG tasks: high score can promote to NORMAL */
+		min_nice = HAPPY_HOG_MIN_VIRT_NICE; /* 11 */
+		max_nice = HAPPY_HOG_MAX_VIRT_NICE; /* 49 */
+		break;
+	default:
+		return base;
+	}
+
+	/* Calculate score */
+	score		    = calc_interactive_score(p, tctx);
+	tctx->dynamic_score = score;
+
+	/* Map score (0-1000) to virt_nice range */
+	if (tctx->base_queue == HAPPY_QUEUE_HOG) {
+		/* HOG tasks: high score can promote to NORMAL */
+		if (score > interactive_threshold) {
+			/* Promote toward NORMAL range */
+			s16 promotion = ((score - interactive_threshold) * 15) /
+					(1000 - interactive_threshold);
+			target	      = HAPPY_HOG_MIN_VIRT_NICE - promotion;
+			if (target < HAPPY_NORMAL_MIN_VIRT_NICE)
+				target = HAPPY_NORMAL_MIN_VIRT_NICE;
+		} else {
+			target = base;
+		}
+	} else {
+		/* LC and NORMAL: interactive score adjusts within range */
+		/* Score 0 = max_nice (least priority in queue) */
+		/* Score 1000 = min_nice (highest priority in queue) */
+		range	   = max_nice - min_nice;
+		s16 offset = (s16)((score * range) / 1000);
+		target = max_nice -
+			 offset; /* Higher score = lower (better) virt_nice */
+
+		/* Smooth toward base if not very different */
+		if (abs_s16(target - base) < 5)
+			target = base;
+	}
+
+	return target;
+}
+
+/* Apply smoothing to avoid virt_nice thrashing */
+static s16 smooth_virt_nice_transition(struct task_ctx *tctx, s16 target)
+{
+	s16 current = tctx->virt_nice;
+	s16 diff    = target - current;
+	s16 step;
+
+	/* Don't adjust too quickly - max 5 units per adjustment */
+	if (diff > 5)
+		step = 5;
+	else if (diff < -5)
+		step = -5;
+	else
+		step = diff;
+
+	return current + step;
+}
+
 /* Get DSQ ID for queue and LLC */
 static inline u64 get_dsq_for_queue(enum happy_queue queue, u32 llc_id)
 {
@@ -408,16 +600,34 @@ static inline u64 get_lag_for_queue(enum happy_queue queue)
 /* Init task - called when task is first seen by scheduler */
 static void init_task(struct task_struct *p, struct task_ctx *tctx)
 {
-	tctx->queue	   = classify_task(p, tctx);
-	tctx->vtime	   = vtime_now;
-	tctx->exec_runtime = 0;
-	tctx->last_run_at  = 0;
-	tctx->last_cpu	   = -1; /* Initialize to -1 to indicate never ran */
+	enum happy_queue queue;
+	u64		 now;
+
+	queue		     = classify_task(p, tctx);
+	tctx->queue	     = queue;
+	tctx->base_queue     = queue; /* Store original queue */
+	tctx->base_virt_nice = tctx->virt_nice; /* Store original virt_nice */
+	tctx->vtime	     = vtime_now;
+	tctx->exec_runtime   = 0;
+	tctx->last_run_at    = 0;
+	tctx->last_cpu	     = -1; /* Initialize to -1 to indicate never ran */
 
 	/* CPU tracking init for HOG demotion */
-	tctx->cpu_window_start	 = bpf_ktime_get_ns();
+	now			 = bpf_ktime_get_ns();
+	tctx->cpu_window_start	 = now;
 	tctx->cpu_window_runtime = 0;
 	tctx->demote_to_hog	 = false;
+
+	/* NEW: Initialize behavioral tracking */
+	tctx->wait_freq		= 0;
+	tctx->wake_freq		= 0;
+	tctx->avg_runtime_ns	= 0;
+	tctx->last_runnable_ns	= 0;
+	tctx->last_quiescent_ns = now;
+	tctx->flags		= HAPPY_FLAG_DYNAMIC_ADJUST;
+	tctx->target_virt_nice	= tctx->virt_nice;
+	tctx->dynamic_score	= 500; /* Start neutral */
+	tctx->last_recalc_ns	= now;
 
 	/* Count classified tasks (non-default queue) */
 	if (tctx->queue != HAPPY_QUEUE_NORMAL)
@@ -562,11 +772,15 @@ s32 BPF_STRUCT_OPS(happy_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/* Fallback: any allowed CPU */
-	cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
-	if (cpu < 0)
-		return prev_cpu; /* Never return error - use prev_cpu as final fallback */
+	cpu = scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr,
+				     avoid_smt ? SCX_PICK_IDLE_CORE : 0);
+	if (cpu >= 0) {
+		if (avoid_smt)
+			__sync_fetch_and_add(&nr_smt_avoided, 1);
+		return cpu;
+	}
 
-	return cpu;
+	return prev_cpu; /* Never return error - use prev_cpu as final fallback */
 }
 
 void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
@@ -714,15 +928,18 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 {
 	struct task_ctx *tctx;
 	struct cpu_ctx	*cpuc;
+	u64		 now, delta;
+	s32		 cpu;
 
 	tctx = lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
-	tctx->last_run_at = bpf_ktime_get_ns();
+	now		  = bpf_ktime_get_ns();
+	tctx->last_run_at = now;
 
 	/* Track migrations */
-	s32 cpu = scx_bpf_task_cpu(p);
+	cpu = scx_bpf_task_cpu(p);
 	if (tctx->last_cpu >= 0 && tctx->last_cpu != cpu)
 		__sync_fetch_and_add(&nr_migrations, 1);
 	tctx->last_cpu = cpu;
@@ -752,6 +969,65 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 		}
 
 		scx_bpf_cpuperf_set(cpu, perf);
+	}
+
+	/* NEW: Update average runtime from previous execution */
+	if (tctx->exec_runtime > 0) {
+		/* EWMA of runtime: new = (old * 3 + new) / 4 */
+		if (tctx->avg_runtime_ns == 0)
+			tctx->avg_runtime_ns = tctx->exec_runtime;
+		else
+			tctx->avg_runtime_ns = (tctx->avg_runtime_ns * 3 +
+						tctx->exec_runtime) /
+					       4;
+	}
+
+	/* NEW: Recalculate dynamic virt_nice periodically */
+	if (dynamic_nice_enabled && (tctx->flags & HAPPY_FLAG_DYNAMIC_ADJUST)) {
+		delta = now - tctx->last_recalc_ns;
+
+		if (delta >= adjust_interval_ns) {
+			s16 target = calc_dynamic_virt_nice(p, tctx);
+			s16 new_nice =
+				smooth_virt_nice_transition(tctx, target);
+
+			/* Apply change if different */
+			if (new_nice != tctx->virt_nice) {
+				enum happy_queue new_queue;
+
+				/* Determine new queue */
+				if (new_nice <= HAPPY_LC_MAX_VIRT_NICE)
+					new_queue = HAPPY_QUEUE_LC;
+				else if (new_nice <= HAPPY_NORMAL_MAX_VIRT_NICE)
+					new_queue = HAPPY_QUEUE_NORMAL;
+				else
+					new_queue = HAPPY_QUEUE_HOG;
+
+				/* Apply change */
+				enum happy_queue old_queue = tctx->queue;
+				tctx->virt_nice		   = new_nice;
+				tctx->queue		   = new_queue;
+				tctx->last_recalc_ns	   = now;
+
+				/* Count statistics */
+				__sync_fetch_and_add(&nr_dynamic_adjustments,
+						     1);
+				if (tctx->dynamic_score > interactive_threshold)
+					__sync_fetch_and_add(
+						&nr_interactive_detected, 1);
+				if (new_queue <
+				    old_queue) /* Better queue = lower enum value */
+					__sync_fetch_and_add(&nr_promotions, 1);
+				else if (new_queue > old_queue)
+					__sync_fetch_and_add(&nr_demotions, 1);
+
+				if (debug)
+					bpf_printk(
+						"Task %d: virt_nice -> %d (score %u)",
+						p->pid, new_nice,
+						tctx->dynamic_score);
+			}
+		}
 	}
 }
 
@@ -824,6 +1100,98 @@ void BPF_STRUCT_OPS(happy_update_idle, s32 cpu, bool idle)
 	/* CPU idle state changed */
 }
 
+/* NEW: Track when task becomes runnable for wait frequency calculation */
+void BPF_STRUCT_OPS(happy_runnable, struct task_struct *p, u64 enq_flags)
+{
+	struct task_ctx	   *tctx, *waker_tctx;
+	struct task_struct *waker;
+	u64		    now, interval;
+
+	tctx = lookup_task_ctx(p);
+	if (!tctx)
+		return;
+
+	now = bpf_ktime_get_ns();
+
+	/* Track how often this task becomes runnable (wait frequency inverse) */
+	if (tctx->last_quiescent_ns > 0) {
+		interval	= now - tctx->last_quiescent_ns;
+		tctx->wait_freq = calc_avg_freq(tctx->wait_freq, interval);
+	}
+	tctx->last_runnable_ns = now;
+
+	/* Set wakeup flags based on how we were woken */
+	if (enq_flags & SCX_ENQ_WAKEUP) {
+		tctx->flags |= HAPPY_FLAG_IS_WAKEUP;
+
+		/* Check for sync wakeup */
+		if ((enq_flags & SCX_WAKE_SYNC))
+			tctx->flags |= HAPPY_FLAG_IS_SYNC_WAKEUP;
+
+		/* Check if woken by IRQ context (x86/arm64 only) */
+#if defined(__x86_64__) || defined(__aarch64__)
+		if (bpf_in_hardirq() || bpf_in_nmi() ||
+		    bpf_in_serving_softirq())
+			tctx->flags |= HAPPY_FLAG_WOKEN_BY_IRQ;
+#endif
+	}
+
+	/* Only track waker relationships for actual wakeups */
+	if (!(enq_flags & SCX_ENQ_WAKEUP))
+		return;
+
+	/* Filter out preempt/reenqueue cases */
+	if (enq_flags & (SCX_ENQ_PREEMPT | SCX_ENQ_REENQ | SCX_ENQ_LAST))
+		return;
+
+	/* Architecture-specific: IRQ detection only on x86/arm64 */
+#if defined(__x86_64__) || defined(__aarch64__)
+	if (bpf_in_hardirq() || bpf_in_nmi() || bpf_in_serving_softirq())
+		return;
+#endif
+
+	/* Get waker */
+	waker = bpf_get_current_task_btf();
+	if (!waker || waker == p)
+		return;
+
+	/* Confine to related tasks (same thread group) to reduce noise */
+	if (p->tgid != waker->tgid)
+		return;
+
+	/* Track waker's wake frequency (producer behavior) */
+	waker_tctx = lookup_task_ctx(waker);
+	if (waker_tctx && waker_tctx->last_runnable_ns > 0) {
+		interval = now - waker_tctx->last_runnable_ns;
+		if (interval >= 500000) { /* Min 500us between wake updates */
+			waker_tctx->wake_freq =
+				calc_avg_freq(waker_tctx->wake_freq, interval);
+		}
+	}
+}
+
+/* NEW: Track when task goes to sleep for wait frequency calculation */
+void BPF_STRUCT_OPS(happy_quiescent, struct task_struct *p, u64 deq_flags)
+{
+	struct task_ctx *tctx;
+	u64		 now;
+
+	tctx = lookup_task_ctx(p);
+	if (!tctx)
+		return;
+
+	/* Only care about tasks going to sleep */
+	if (!(deq_flags & SCX_DEQ_SLEEP))
+		return;
+
+	now			= bpf_ktime_get_ns();
+	tctx->last_quiescent_ns = now;
+
+	/* Clear one-shot flags */
+	tctx->flags &= ~(HAPPY_FLAG_IS_WAKEUP | HAPPY_FLAG_IS_SYNC_WAKEUP |
+			 HAPPY_FLAG_WOKEN_BY_IRQ);
+}
+
 SCX_OPS_DEFINE(happy_ops, .init = (void *)happy_init,
 	       .exit = (void *)happy_exit, .enable = (void *)happy_enable,
 	       .disable	   = (void *)happy_disable,
@@ -832,6 +1200,8 @@ SCX_OPS_DEFINE(happy_ops, .init = (void *)happy_init,
 	       .dispatch = (void *)happy_dispatch, .tick = (void *)happy_tick,
 	       .running	    = (void *)happy_running,
 	       .stopping    = (void *)happy_stopping,
+	       .runnable    = (void *)happy_runnable, /* NEW */
+	       .quiescent   = (void *)happy_quiescent, /* NEW */
 	       .set_weight  = (void *)happy_set_weight,
 	       .set_cpumask = (void *)happy_set_cpumask,
 	       .init_task   = (void *)happy_init_task,

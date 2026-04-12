@@ -88,6 +88,18 @@ struct Opts {
     #[clap(long, value_name = "PERCENT", default_value = "50")]
     hog_cpu_threshold: u8,
 
+    /// Disable dynamic virtual nice adjustment
+    #[clap(long)]
+    disable_dynamic_nice: bool,
+
+    /// Dynamic adjustment interval (us)
+    #[clap(long, value_name = "MICROSECONDS", default_value = "10000")]
+    adjust_interval_us: u64,
+
+    /// Interactive threshold (0-1000, higher = more strict)
+    #[clap(long, value_name = "SCORE", default_value = "700")]
+    interactive_threshold: u32,
+
     #[clap(flatten)]
     libbpf: LibbpfOpts,
 }
@@ -576,6 +588,9 @@ fn main() -> Result<()> {
     rodata.antistall_sec = opts.antistall_sec;
     rodata.debug = opts.verbose as u32;
     rodata.hog_cpu_threshold = opts.hog_cpu_threshold;
+    rodata.dynamic_nice_enabled = !opts.disable_dynamic_nice;
+    rodata.adjust_interval_ns = opts.adjust_interval_us * 1000;
+    rodata.interactive_threshold = opts.interactive_threshold;
 
     // Load the skeleton
     let mut skel = scx_ops_load!(open_skel, happy_ops, uei)?;

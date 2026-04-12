@@ -70,6 +70,11 @@ struct happy_stats {
 	u64 nr_antistall_dispatches;
 	u64 nr_smt_avoided;
 	u64 nr_classified_tasks;
+	/* NEW: Dynamic adjustment statistics */
+	u64 nr_dynamic_adjustments; /* How many times virt_nice was adjusted */
+	u64 nr_interactive_detected; /* Tasks detected as interactive */
+	u64 nr_promotions; /* Tasks promoted to better queue */
+	u64 nr_demotions; /* Tasks demoted to worse queue */
 };
 
 /* Per-queue configuration */
