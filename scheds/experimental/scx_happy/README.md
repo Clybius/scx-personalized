@@ -39,6 +39,22 @@ Within each queue, tasks are ordered using EEVDF (Earliest Eligible Virtual Dead
 - **Ineligible tasks** are ordered by their vruntime, allowing them to catch up in fairness
 - The scheduler dispatches the earliest eligible deadline task first
 
+Eligible tasks can preempt currently running tasks through the deadline-based preemption mechanism described below.
+
+### Deadline-Based Preemption
+
+Building on the EEVDF foundation, scx_happy implements deadline-based preemption that allows eligible tasks to interrupt running tasks when they have earlier virtual deadlines:
+
+**Preemption Rules:**
+1. **Queue Priority Preemption**: LC tasks can always preempt NORMAL and HOG tasks, and NORMAL tasks can preempt HOG tasks, regardless of deadlines
+2. **Same-Queue Preemption**: Within the same queue, a task can preempt the running task if it has an earlier virtual deadline (`vruntime + vslice`)
+3. **Eligibility Requirement**: Only eligible tasks (those owed CPU time, where `vtime <= avg_vtime`) can trigger preemption
+
+**Hysteresis Mechanism:**
+To prevent excessive context switching (ping-pong), preemption includes a hysteresis threshold (default 10% of the running task's vslice, configurable via `--preemption-hysteresis-pct`). A task will only preempt if its deadline is earlier by at least this threshold.
+
+This mechanism ensures that latency-critical tasks get immediate access to the CPU when they have urgent deadlines, while preventing thrashing from tasks with nearly-identical deadlines. Use `--disable-deadline-preemption` to disable this feature.
+
 ### Dynamic Virtual Nice Adjustment
 
 Every 10ms (configurable via `--adjust-interval-us`), the scheduler recalculates an interactive score (0-1000) for each task based on:
@@ -51,16 +67,32 @@ Every 10ms (configurable via `--adjust-interval-us`), the scheduler recalculates
 
 Tasks with scores above the interactive threshold (default 700) have their virtual nice value adjusted toward more favorable values, limited to maximum changes of 5 units per adjustment period for smooth transitions.
 
-### HOG Demotion
+### HOG Demotion and Promotion
 
-NORMAL tasks that consume more than 50% CPU over a 100ms measurement window are automatically demoted to the HOG queue. This prevents background batch work from interfering with interactive tasks. HOG tasks can be promoted back to NORMAL if they exhibit highly interactive behavior patterns.
+**Demotion:**
+NORMAL tasks that consume more than 50% CPU over a 100ms measurement window (configurable via `--hog-cpu-threshold`) are automatically demoted to the HOG queue. This prevents background batch work from interfering with interactive tasks.
+
+**Promotion via Lag Decay:**
+HOG tasks can be promoted back to NORMAL through a sophisticated lag decay mechanism that tracks accumulated sleep time:
+
+- **Lag Tracking**: Each task maintains a "lag" value representing CPU time owed to the task (similar to EEVDF eligibility). This accumulates while the task waits to run.
+- **Sleep-Based Decay**: While a HOG task is sleeping (not runnable), its accumulated lag decays exponentially. The decay applies every 20ms of accumulated sleep time (configurable via `--hog-decay-interval-us`), reducing the lag by 75% each time (`lag = lag >> 2`, keeping 25%).
+- **Promotion Criteria**: A HOG task is eligible for promotion when:
+  1. It has accumulated at least 3 sleep cycles while in HOG (configurable via `--hog-min-sleep-count`)
+  2. Total sleep time reaches at least 50ms (configurable via `--hog-min-sleep-duration-us`)
+  3. The task is eligible (lag >= 0, meaning it's owed CPU time)
+  4. The task shows interactive behavior patterns (wait frequency above threshold)
+
+This decay mechanism allows batch tasks that periodically sleep (e.g., checking for work, I/O wait) to gradually become eligible for promotion back to NORMAL, while true CPU hogs remain in the HOG queue. Use `--disable-hog-lag-decay` to disable this promotion mechanism.
 
 ### Additional Features
 
+- **Deadline-Based Preemption**: EEVDF-style preemption allows eligible tasks with earlier deadlines to interrupt running tasks (with hysteresis to prevent thrashing)
 - **SMT Avoidance**: Prefers non-SMT siblings to reduce contention
 - **Cache Affinity**: Attempts to keep tasks on the same LLC
 - **CPU Frequency Scaling**: LC queue tasks run at max frequency, HOG at min
 - **Antistall Protection**: Tasks stalled for more than 3 seconds are rescued
+- **HOG Lag Decay**: Exponential decay of accumulated lag during sleep enables promotion of well-behaved batch tasks back to NORMAL queue
 
 ## Typical Use Case
 
