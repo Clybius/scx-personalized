@@ -63,6 +63,15 @@ const volatile s16  normal_virt_nice_boost = 15; /* Boost within NORMAL range */
 const volatile s16  hog_virt_nice_penalty  = 10; /* Penalty within HOG range */
 const volatile u32  interactive_threshold  = 700; /* Score >700 = interactive */
 
+/* Lag decay parameters for HOG promotion */
+const volatile bool hog_lag_decay_enabled = true; /* Enable lag decay */
+const volatile u64  hog_decay_interval_ns =
+	20000000; /* Decay every 20ms of sleep */
+const volatile u64 hog_min_sleep_duration_ns =
+	50000000; /* Need 50ms total sleep to promote */
+const volatile u32 hog_min_sleep_count =
+	3; /* Min sleep cycles before promotion */
+
 /* Dynamic adjustment flags */
 #define HAPPY_FLAG_IS_SYNC_WAKEUP 0x00000001 /* Woken via sync wakeup */
 #define HAPPY_FLAG_IS_WAKEUP 0x00000002 /* Recently woken */
@@ -102,12 +111,16 @@ volatile u64 nr_ineligible_dispatches;
 volatile u64 nr_deadline_expired;
 
 /* NEW: Deadline preemption statistics */
-volatile u64	   nr_deadline_preemptions;
-volatile u64	   nr_queue_priority_preemptions;
-volatile u64	   nr_same_queue_preemptions;
-volatile u64	   nr_preemptions_skipped;
-volatile u64	   nr_preemptions_ineligible;
-volatile u64	   nr_preemptions_later_deadline;
+volatile u64 nr_deadline_preemptions;
+volatile u64 nr_queue_priority_preemptions;
+volatile u64 nr_same_queue_preemptions;
+volatile u64 nr_preemptions_skipped;
+volatile u64 nr_preemptions_ineligible;
+volatile u64 nr_preemptions_later_deadline;
+
+/* NEW: Lag decay statistics */
+volatile u64	   nr_hog_sleep_decayed; /* Times HOG sleep was decayed */
+volatile u64	   nr_hog_promotion_checks; /* Promotion eligibility checks */
 
 const volatile u32 debug    = 0;
 const u32	   zero_u32 = 0;
@@ -153,6 +166,13 @@ struct task_ctx {
 	u64 deadline_vtime; /* Virtual deadline */
 	u64 weight; /* WFQ weight based on virt_nice */
 	u64 vslice; /* Virtual slice = slice * NICE_0_WEIGHT / weight */
+
+	/* NEW: Lag decay tracking for HOG demoted tasks */
+	u64  hog_demoted_at; /* Timestamp when demoted to HOG */
+	u64  sleep_start_ns; /* When task started current sleep */
+	u64  total_sleep_ns; /* Accumulated sleep time while HOG */
+	u32  hog_sleep_count; /* Number of sleeps while HOG */
+	bool can_promote; /* Flag: eligible for promotion to NORMAL */
 };
 
 /* Per-task storage map */
@@ -545,6 +565,48 @@ static inline u64 calc_avg_freq(u64 curr_freq, u64 interval_ns)
 		return new_freq;
 
 	return ((curr_freq * 3) + new_freq) / 4;
+}
+
+/*
+ * Apply exponential decay to accumulated sleep time
+ * Returns decayed value: value >>= 2 (25% of original = 75% decay)
+ */
+static inline u64 decay_accumulated_time(u64 value)
+{
+	/* Shift right by 2 = divide by 4 = keep 25% = 75% decay */
+	return value >> 2;
+}
+
+/*
+ * Check if a HOG task should be promoted back to NORMAL
+ * Based on:
+ * 1. Sufficient sleep cycles (interactive pattern)
+ * 2. Sufficient accumulated sleep time (not just brief sleeps)
+ * 3. Task is currently eligible (lag >= 0, owed CPU time)
+ */
+static inline bool should_promote_from_hog(struct task_ctx *tctx)
+{
+	if (!hog_lag_decay_enabled)
+		return false;
+
+	/* Must have minimum sleep cycles */
+	if (tctx->hog_sleep_count < hog_min_sleep_count)
+		return false;
+
+	/* Must have accumulated enough sleep time */
+	if (tctx->total_sleep_ns < hog_min_sleep_duration_ns)
+		return false;
+
+	/* Must be eligible (task is owed CPU time, not ahead) */
+	if (!is_eligible(tctx, HAPPY_QUEUE_HOG))
+		return false;
+
+	/* Check if task has become more interactive */
+	u64 wait_freq_threshold = HAPPY_FREQ_MAX / 10; /* ~10K sleeps/sec */
+	if (tctx->wait_freq >= wait_freq_threshold)
+		return true;
+
+	return false;
 }
 
 /* Calculate absolute value for s16 */
@@ -1011,8 +1073,19 @@ void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->demote_to_hog = false;
 		/* Reset weight for new queue */
 		tctx->weight = calc_weight_from_virt_nice(tctx->virt_nice);
+
+		/* NEW: Initialize lag decay tracking for HOG demoted tasks */
+		if (hog_lag_decay_enabled) {
+			tctx->hog_demoted_at  = bpf_ktime_get_ns();
+			tctx->total_sleep_ns  = 0;
+			tctx->hog_sleep_count = 0;
+			tctx->can_promote     = false;
+			tctx->sleep_start_ns  = 0;
+		}
+
 		if (debug)
-			bpf_printk("Task %d demoted to HOG queue", p->pid);
+			bpf_printk("Task %d demoted to HOG (demoted_at=%llu)",
+				   p->pid, tctx->hog_demoted_at);
 	}
 
 	/* Update EEVDF state (weight, vslice, deadline) */
@@ -1450,13 +1523,98 @@ void BPF_STRUCT_OPS(happy_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx	   *tctx, *waker_tctx;
 	struct task_struct *waker;
-	u64		    now, interval;
+	u64		    now, interval, sleep_duration;
 
 	tctx = lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
 	now = bpf_ktime_get_ns();
+
+	/* NEW: Handle HOG lag decay and promotion */
+	if (hog_lag_decay_enabled && tctx->queue == HAPPY_QUEUE_HOG) {
+		/* Calculate sleep duration if we have a sleep start */
+		if (tctx->sleep_start_ns > 0) {
+			sleep_duration = now - tctx->sleep_start_ns;
+
+			/* Accumulate sleep time */
+			tctx->total_sleep_ns += sleep_duration;
+
+			/* Apply exponential decay to accumulated sleep every interval */
+			if (tctx->total_sleep_ns >= hog_decay_interval_ns) {
+				tctx->total_sleep_ns = decay_accumulated_time(
+					tctx->total_sleep_ns);
+				__sync_fetch_and_add(&nr_hog_sleep_decayed, 1);
+
+				if (debug)
+					bpf_printk(
+						"Task %d HOG sleep decayed (total=%llu, count=%u)",
+						p->pid, tctx->total_sleep_ns,
+						tctx->hog_sleep_count);
+			}
+
+			/* Reset sleep start */
+			tctx->sleep_start_ns = 0;
+		}
+
+		/* Check for promotion eligibility */
+		__sync_fetch_and_add(&nr_hog_promotion_checks, 1);
+		if (!tctx->can_promote && should_promote_from_hog(tctx)) {
+			tctx->can_promote = true;
+			if (debug)
+				bpf_printk("Task %d HOG promotion eligible",
+					   p->pid);
+		}
+
+		/* NEW: Handle promotion from HOG to NORMAL */
+		if (tctx->can_promote) {
+			u64		 old_weight = tctx->weight;
+			enum happy_queue old_queue  = tctx->queue;
+			u32		 old_key    = (u32)old_queue;
+
+			/* Remove from HOG queue state */
+			struct queue_eevdf_state *old_state =
+				bpf_map_lookup_elem(&queue_eevdf_states,
+						    &old_key);
+			if (old_state && old_weight > 0) {
+				if (old_state->total_weight >= old_weight)
+					old_state->total_weight -= old_weight;
+				if (old_state->nr_tasks > 0)
+					old_state->nr_tasks--;
+			}
+
+			/* Promote to NORMAL */
+			tctx->queue = HAPPY_QUEUE_NORMAL;
+			/* Set virt_nice to mid-normal range */
+			tctx->virt_nice = (HAPPY_NORMAL_MIN_VIRT_NICE +
+					   HAPPY_NORMAL_MAX_VIRT_NICE) /
+					  2;
+			tctx->weight =
+				calc_weight_from_virt_nice(tctx->virt_nice);
+
+			/* Add to NORMAL queue state */
+			u32 new_key = (u32)HAPPY_QUEUE_NORMAL;
+			struct queue_eevdf_state *new_state =
+				bpf_map_lookup_elem(&queue_eevdf_states,
+						    &new_key);
+			if (new_state) {
+				new_state->total_weight += tctx->weight;
+				new_state->nr_tasks++;
+			}
+
+			/* Reset HOG tracking state */
+			tctx->can_promote     = false;
+			tctx->hog_sleep_count = 0;
+			tctx->total_sleep_ns  = 0;
+
+			__sync_fetch_and_add(&nr_promotions, 1);
+
+			if (debug)
+				bpf_printk(
+					"Task %d promoted HOG->NORMAL (virt_nice=%d)",
+					p->pid, tctx->virt_nice);
+		}
+	}
 
 	/* Track how often this task becomes runnable (wait frequency inverse) */
 	if (tctx->last_quiescent_ns > 0) {
@@ -1531,6 +1689,16 @@ void BPF_STRUCT_OPS(happy_quiescent, struct task_struct *p, u64 deq_flags)
 
 	now			= bpf_ktime_get_ns();
 	tctx->last_quiescent_ns = now;
+
+	/* NEW: Track sleep start for HOG lag decay */
+	if (hog_lag_decay_enabled && tctx->queue == HAPPY_QUEUE_HOG) {
+		tctx->sleep_start_ns = now;
+		tctx->hog_sleep_count++;
+
+		if (debug)
+			bpf_printk("Task %d HOG sleep start (count=%u)", p->pid,
+				   tctx->hog_sleep_count);
+	}
 
 	/* Clear one-shot flags */
 	tctx->flags &= ~(HAPPY_FLAG_IS_WAKEUP | HAPPY_FLAG_IS_SYNC_WAKEUP |

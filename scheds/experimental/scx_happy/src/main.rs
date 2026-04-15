@@ -109,6 +109,22 @@ struct Opts {
     #[clap(long, default_value = "10")]
     preemption_hysteresis_pct: u8,
 
+    /// Disable HOG lag decay mechanism
+    #[clap(long)]
+    disable_hog_lag_decay: bool,
+
+    /// HOG decay interval in microseconds (sleep time before decay)
+    #[clap(long, default_value = "20000")]
+    hog_decay_interval_us: u64,
+
+    /// Minimum total sleep duration in microseconds for HOG promotion
+    #[clap(long, default_value = "50000")]
+    hog_min_sleep_duration_us: u64,
+
+    /// Minimum sleep cycles before HOG promotion
+    #[clap(long, default_value = "3")]
+    hog_min_sleep_count: u32,
+
     #[clap(flatten)]
     libbpf: LibbpfOpts,
 }
@@ -543,6 +559,8 @@ fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
         deadline_preemptions,
         queue_priority_preemptions,
         same_queue_preemptions,
+        hog_sleep_decayed,
+        hog_promotion_checks,
     ) = if let Some(bss) = skel.maps.bss_data.as_ref() {
         (
             bss.nr_lc_dispatches,
@@ -556,9 +574,11 @@ fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
             bss.nr_deadline_preemptions,
             bss.nr_queue_priority_preemptions,
             bss.nr_same_queue_preemptions,
+            bss.nr_hog_sleep_decayed,
+            bss.nr_hog_promotion_checks,
         )
     } else {
-        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     };
 
     let total_dispatches = lc + normal + hog;
@@ -583,6 +603,10 @@ fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
     info!(
         "Deadline Preemptions: Total={}, Queue Priority={}, Same Queue={}",
         deadline_preemptions, queue_priority_preemptions, same_queue_preemptions
+    );
+    info!(
+        "HOG Lag Decay: sleep_decayed={}, promotion_checks={}",
+        hog_sleep_decayed, hog_promotion_checks
     );
 }
 
@@ -689,6 +713,11 @@ fn main() -> Result<()> {
     rodata.interactive_threshold = opts.interactive_threshold;
     rodata.deadline_preemption_enabled = !opts.disable_deadline_preemption;
     rodata.preemption_hysteresis_pct = opts.preemption_hysteresis_pct;
+    // NEW: HOG lag decay configuration
+    rodata.hog_lag_decay_enabled = !opts.disable_hog_lag_decay;
+    rodata.hog_decay_interval_ns = opts.hog_decay_interval_us * 1000;
+    rodata.hog_min_sleep_duration_ns = opts.hog_min_sleep_duration_us * 1000;
+    rodata.hog_min_sleep_count = opts.hog_min_sleep_count;
 
     // Load the skeleton
     let mut skel = scx_ops_load!(open_skel, happy_ops, uei)?;

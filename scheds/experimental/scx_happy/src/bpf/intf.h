@@ -93,6 +93,9 @@ struct happy_stats {
 	u64 normal_avg_vtime; /* NORMAL queue weighted avg vtime */
 	u64 hog_min_vtime; /* HOG queue min vtime */
 	u64 hog_avg_vtime; /* HOG queue weighted avg vtime */
+	/* NEW: Lag decay statistics */
+	u64 nr_hog_sleep_decayed; /* Times HOG sleep was decayed */
+	u64 nr_hog_promotion_checks; /* Promotion eligibility checks */
 };
 
 /* Domain configuration flags */
