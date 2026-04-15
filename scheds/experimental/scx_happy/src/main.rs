@@ -29,104 +29,195 @@ pub mod bpf_intf;
     about = "Happy scheduler with virtual nice and multi-queue"
 )]
 struct Opts {
-    /// LC queue max slice (us)
+    // === Slice Configuration ===
+    /// LC (latency-critical) queue max slice in microseconds.
+    ///
+    /// Tasks in this queue get the shortest time slices and highest priority, suitable for
+    /// interactive and real-time workloads.
     #[clap(long, default_value = "500")]
     lc_slice_us: u64,
 
-    /// NORMAL queue max slice (us)
+    /// NORMAL queue max slice in microseconds.
+    ///
+    /// Standard tasks run in this queue with moderate time slices.
     #[clap(long, default_value = "1000")]
     normal_slice_us: u64,
 
-    /// HOG queue max slice (us)
+    /// HOG queue max slice in microseconds.
+    ///
+    /// CPU-intensive background tasks are demoted to this queue with longer time slices to
+    /// prevent them from interfering with interactive workloads.
     #[clap(long, default_value = "3000")]
     hog_slice_us: u64,
 
-    /// Disable SMT contention avoidance
-    #[clap(long)]
-    disable_smt_avoid: bool,
-
-    /// Disable cache affinity
-    #[clap(long)]
-    disable_cache_affinity: bool,
-
-    /// Disable cpufreq scaling
-    #[clap(long)]
-    disable_cpufreq: bool,
-
-    /// LC domain (turbo/performance/powersave/CPUs)
+    // === Domain Assignment ===
+    /// LC domain - CPU set for latency-critical tasks.
+    ///
+    /// Special values:
+    ///   - "turbo" = use turbo/performance CPUs (highest capacity)
+    ///   - "performance" = use performance CPUs (big cores)
+    ///   - "powersave" = use power-efficient CPUs (little cores)
+    ///   - Custom cpumask in hex (e.g., "0xff") for specific CPUs
     #[clap(long, default_value = "turbo")]
     lc_domain: String,
 
-    /// NORMAL domain
+    /// NORMAL domain - CPU set for standard tasks.
+    ///
+    /// Special values:
+    ///   - "turbo" = use turbo/performance CPUs (highest capacity)
+    ///   - "performance" = use performance CPUs (big cores)
+    ///   - "powersave" = use power-efficient CPUs (little cores)
+    ///   - Custom cpumask in hex (e.g., "0xff") for specific CPUs
     #[clap(long, default_value = "performance")]
     normal_domain: String,
 
-    /// HOG domain
+    /// HOG domain - CPU set for CPU-intensive background tasks.
+    ///
+    /// Special values:
+    ///   - "turbo" = use turbo/performance CPUs (highest capacity)
+    ///   - "performance" = use performance CPUs (big cores)
+    ///   - "powersave" = use power-efficient CPUs (little cores)
+    ///   - Custom cpumask in hex (e.g., "0xff") for specific CPUs
     #[clap(long, default_value = "powersave")]
     hog_domain: String,
 
-    /// Antistall timeout (seconds)
-    #[clap(long, default_value = "3")]
-    antistall_sec: u64,
+    // === Feature Disablers ===
+    /// Disable SMT contention avoidance.
+    ///
+    /// When enabled, the scheduler avoids placing tasks on sibling threads of busy cores
+    /// to reduce SMT contention. Disabling this may increase throughput for CPU-bound
+    /// workloads but can hurt latency-sensitive tasks due to resource contention.
+    #[clap(long)]
+    disable_smt_avoid: bool,
 
-    /// TGID poll interval (ms)
-    #[clap(long, default_value = "500")]
-    tgid_poll_ms: u64,
+    /// Disable cache affinity optimization.
+    ///
+    /// Cache affinity tries to keep tasks on CPUs where they have established cache
+    /// residency. Disabling this may cause more task migrations, potentially hurting
+    /// performance for cache-sensitive workloads.
+    #[clap(long)]
+    disable_cache_affinity: bool,
 
-    /// Disable antistall
+    /// Disable CPU frequency scaling.
+    ///
+    /// When enabled, the scheduler can request frequency changes based on workload
+    /// characteristics. Disabling this prevents frequency adjustments, using the system's
+    /// default governor behavior instead.
+    #[clap(long)]
+    disable_cpufreq: bool,
+
+    /// Disable antistall mechanism.
+    ///
+    /// Antistall periodically boosts stuck tasks to prevent system hangs. Disabling
+    /// this may improve performance in some cases but risks task starvation if the
+    /// scheduler logic encounters edge cases.
     #[clap(long)]
     disable_antistall: bool,
 
-    /// Verbose output
-    #[clap(short, long)]
-    verbose: bool,
-
-    /// Print scheduler stats every N seconds
-    #[clap(long, value_name = "SECONDS")]
-    stats: Option<u64>,
-
-    /// CPU usage threshold (%) to demote NORMAL tasks to HOG
-    #[clap(long, value_name = "PERCENT", default_value = "50")]
-    hog_cpu_threshold: u8,
-
-    /// Disable dynamic virtual nice adjustment
+    /// Disable dynamic virtual nice adjustment.
+    ///
+    /// Dynamic nice automatically adjusts task priorities based on their behavior.
+    /// Disabling this keeps priorities static, which may reduce scheduler overhead
+    /// but could hurt responsiveness for mixed workloads.
     #[clap(long)]
     disable_dynamic_nice: bool,
 
-    /// Dynamic adjustment interval (us)
-    #[clap(long, value_name = "MICROSECONDS", default_value = "10000")]
-    adjust_interval_us: u64,
-
-    /// Interactive threshold (0-1000, higher = more strict)
-    #[clap(long, value_name = "SCORE", default_value = "700")]
-    interactive_threshold: u32,
-
-    /// Disable deadline-based preemption (EEVDF-style)
+    /// Disable deadline-based preemption (EEVDF-style).
+    ///
+    /// Deadline preemption uses earliest-eligible-virtual-deadline-first scheduling
+    /// for fair and responsive task ordering. Disabling this falls back to simpler
+    /// priority-based scheduling, which may be less fair for bursty workloads.
     #[clap(long)]
     disable_deadline_preemption: bool,
 
-    /// Deadline hysteresis threshold (percent of vslice, 0-100)
-    #[clap(long, default_value = "10")]
-    preemption_hysteresis_pct: u8,
-
-    /// Disable HOG lag decay mechanism
+    /// Disable HOG lag decay mechanism.
+    ///
+    /// Lag decay gradually reduces accumulated lag for sleeping HOG tasks, allowing
+    /// them to eventually return to NORMAL queue. Disabling this means HOG tasks
+    /// stay in HOG queue indefinitely, potentially improving batch throughput but
+    /// hurting interactive response after long sleeps.
     #[clap(long)]
     disable_hog_lag_decay: bool,
 
-    /// HOG decay interval in microseconds (sleep time before decay)
+    // === Thresholds ===
+    /// CPU usage threshold (0-100) to demote NORMAL tasks to HOG queue.
+    ///
+    /// Tasks using more than this percentage of CPU are classified as HOG tasks
+    /// and moved to the HOG queue for lower-priority scheduling.
+    #[clap(long, value_name = "PERCENT", default_value = "50")]
+    hog_cpu_threshold: u8,
+
+    /// Interactive task threshold (0-1000, higher = more strict).
+    ///
+    /// Score threshold for classifying tasks as interactive. Higher values require
+    /// tasks to show more interactive behavior (short bursts, frequent sleeps) to
+    /// qualify for LC queue. Lower values are more permissive.
+    #[clap(long, value_name = "SCORE", default_value = "700")]
+    interactive_threshold: u32,
+
+    /// Deadline preemption hysteresis threshold (0-100 percent of vslice).
+    ///
+    /// Hysteresis prevents excessive preemption by requiring a task's deadline
+    /// advantage to exceed this percentage before preempting. Higher values reduce
+    /// preemption frequency, improving throughput but potentially hurting latency.
+    #[clap(long, default_value = "10")]
+    preemption_hysteresis_pct: u8,
+
+    // === Timing/Intervals ===
+    /// Antistall timeout in seconds.
+    ///
+    /// Maximum time a task can wait before being forcefully dispatched to prevent
+    /// system stalls.
+    #[clap(long, default_value = "3")]
+    antistall_sec: u64,
+
+    /// TGID poll interval in milliseconds.
+    ///
+    /// How often to scan for and classify tasks based on their TGID and environment.
+    #[clap(long, default_value = "500")]
+    tgid_poll_ms: u64,
+
+    /// Dynamic adjustment interval in microseconds.
+    ///
+    /// How often the scheduler re-evaluates task priorities and queue assignments
+    /// for dynamic nice adjustments.
+    #[clap(long, value_name = "MICROSECONDS", default_value = "10000")]
+    adjust_interval_us: u64,
+
+    /// HOG decay interval in microseconds (sleep time before decay).
+    ///
+    /// How long a HOG task must sleep before its accumulated lag begins to decay,
+    /// making it eligible for promotion back to NORMAL queue.
     #[clap(long, default_value = "20000")]
     hog_decay_interval_us: u64,
 
-    /// Minimum total sleep duration in microseconds for HOG promotion
+    // === HOG Promotion ===
+    /// Minimum total sleep duration in microseconds for HOG promotion.
+    ///
+    /// HOG tasks must accumulate at least this much sleep time across multiple
+    /// sleep cycles before being considered for promotion to NORMAL queue.
     #[clap(long, default_value = "50000")]
     hog_min_sleep_duration_us: u64,
 
-    /// Minimum sleep cycles before HOG promotion
+    /// Minimum sleep cycles before HOG promotion.
+    ///
+    /// Number of times a HOG task must go to sleep (at least) before being
+    /// eligible for promotion back to NORMAL queue.
     #[clap(long, default_value = "3")]
     hog_min_sleep_count: u32,
 
-    #[clap(flatten)]
-    libbpf: LibbpfOpts,
+    // === Output/Monitoring ===
+    /// Enable verbose output, including libbpf details.
+    #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
+    verbose: bool,
+
+    /// Print scheduler stats every N seconds.
+    #[clap(long, value_name = "SECONDS")]
+    stats: Option<u64>,
+
+    // === Libbpf Options ===
+    #[clap(flatten, next_help_heading = "Libbpf Options")]
+    pub libbpf: LibbpfOpts,
 }
 
 struct TaskClassifier {
