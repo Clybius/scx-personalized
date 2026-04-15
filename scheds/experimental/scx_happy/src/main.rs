@@ -101,6 +101,14 @@ struct Opts {
     #[clap(long, value_name = "SCORE", default_value = "700")]
     interactive_threshold: u32,
 
+    /// Disable deadline-based preemption (EEVDF-style)
+    #[clap(long)]
+    disable_deadline_preemption: bool,
+
+    /// Deadline hysteresis threshold (percent of vslice, 0-100)
+    #[clap(long, default_value = "10")]
+    preemption_hysteresis_pct: u8,
+
     #[clap(flatten)]
     libbpf: LibbpfOpts,
 }
@@ -523,21 +531,35 @@ fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
     info!("=== Scheduler Stats ===");
 
     // Read BPF stats from BSS section
-    let (lc, normal, hog, preemptions, migrations, antistall, smt, classified) =
-        if let Some(bss) = skel.maps.bss_data.as_ref() {
-            (
-                bss.nr_lc_dispatches,
-                bss.nr_normal_dispatches,
-                bss.nr_hog_dispatches,
-                bss.nr_preemptions,
-                bss.nr_migrations,
-                bss.nr_antistall_dispatches,
-                bss.nr_smt_avoided,
-                bss.nr_classified_tasks,
-            )
-        } else {
-            (0, 0, 0, 0, 0, 0, 0, 0)
-        };
+    let (
+        lc,
+        normal,
+        hog,
+        preemptions,
+        migrations,
+        antistall,
+        smt,
+        classified,
+        deadline_preemptions,
+        queue_priority_preemptions,
+        same_queue_preemptions,
+    ) = if let Some(bss) = skel.maps.bss_data.as_ref() {
+        (
+            bss.nr_lc_dispatches,
+            bss.nr_normal_dispatches,
+            bss.nr_hog_dispatches,
+            bss.nr_preemptions,
+            bss.nr_migrations,
+            bss.nr_antistall_dispatches,
+            bss.nr_smt_avoided,
+            bss.nr_classified_tasks,
+            bss.nr_deadline_preemptions,
+            bss.nr_queue_priority_preemptions,
+            bss.nr_same_queue_preemptions,
+        )
+    } else {
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    };
 
     let total_dispatches = lc + normal + hog;
 
@@ -557,6 +579,10 @@ fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
         classifier.de_tgids.len(),
         classifier.input_tgids.len(),
         classifier.audio_tgids.len()
+    );
+    info!(
+        "Deadline Preemptions: Total={}, Queue Priority={}, Same Queue={}",
+        deadline_preemptions, queue_priority_preemptions, same_queue_preemptions
     );
 }
 
@@ -661,6 +687,8 @@ fn main() -> Result<()> {
     rodata.dynamic_nice_enabled = !opts.disable_dynamic_nice;
     rodata.adjust_interval_ns = opts.adjust_interval_us * 1000;
     rodata.interactive_threshold = opts.interactive_threshold;
+    rodata.deadline_preemption_enabled = !opts.disable_deadline_preemption;
+    rodata.preemption_hysteresis_pct = opts.preemption_hysteresis_pct;
 
     // Load the skeleton
     let mut skel = scx_ops_load!(open_skel, happy_ops, uei)?;

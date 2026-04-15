@@ -56,6 +56,25 @@ pub struct HappyMetrics {
     #[stat(desc = "Number of deadline expirations")]
     pub nr_deadline_expired: u64,
 
+    /* Deadline preemption statistics */
+    #[stat(desc = "Number of deadline-based preemptions")]
+    pub nr_deadline_preemptions: u64,
+
+    #[stat(desc = "Number of preemptions due to queue priority")]
+    pub nr_queue_priority_preemptions: u64,
+
+    #[stat(desc = "Number of preemptions within same queue")]
+    pub nr_same_queue_preemptions: u64,
+
+    #[stat(desc = "Number of preemptions skipped due to hysteresis")]
+    pub nr_preemptions_skipped: u64,
+
+    #[stat(desc = "Number of preemptions skipped (ineligible task)")]
+    pub nr_preemptions_ineligible: u64,
+
+    #[stat(desc = "Number of preemptions skipped (later deadline)")]
+    pub nr_preemptions_later_deadline: u64,
+
     /* Per-queue vtime state */
     #[stat(desc = "LC queue minimum vtime")]
     pub lc_min_vtime: u64,
@@ -115,6 +134,12 @@ impl HappyMetrics {
         self.nr_eligible_dispatches = other.nr_eligible_dispatches;
         self.nr_ineligible_dispatches = other.nr_ineligible_dispatches;
         self.nr_deadline_expired = other.nr_deadline_expired;
+        self.nr_deadline_preemptions = other.nr_deadline_preemptions;
+        self.nr_queue_priority_preemptions = other.nr_queue_priority_preemptions;
+        self.nr_same_queue_preemptions = other.nr_same_queue_preemptions;
+        self.nr_preemptions_skipped = other.nr_preemptions_skipped;
+        self.nr_preemptions_ineligible = other.nr_preemptions_ineligible;
+        self.nr_preemptions_later_deadline = other.nr_preemptions_later_deadline;
         self.lc_min_vtime = other.lc_min_vtime;
         self.lc_avg_vtime = other.lc_avg_vtime;
         self.normal_min_vtime = other.normal_min_vtime;

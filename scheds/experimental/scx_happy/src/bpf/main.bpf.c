@@ -97,12 +97,27 @@ volatile u64 nr_promotions;
 volatile u64 nr_demotions;
 
 /* NEW: EEVDF statistics counters */
-volatile u64	   nr_eligible_dispatches;
-volatile u64	   nr_ineligible_dispatches;
-volatile u64	   nr_deadline_expired;
+volatile u64 nr_eligible_dispatches;
+volatile u64 nr_ineligible_dispatches;
+volatile u64 nr_deadline_expired;
+
+/* NEW: Deadline preemption statistics */
+volatile u64	   nr_deadline_preemptions;
+volatile u64	   nr_queue_priority_preemptions;
+volatile u64	   nr_same_queue_preemptions;
+volatile u64	   nr_preemptions_skipped;
+volatile u64	   nr_preemptions_ineligible;
+volatile u64	   nr_preemptions_later_deadline;
 
 const volatile u32 debug    = 0;
 const u32	   zero_u32 = 0;
+
+/* Deadline preemption configuration */
+const volatile bool deadline_preemption_enabled = true;
+const volatile u64  preemption_min_interval_ns =
+	500000; /* 500us minimum between preemptions */
+const volatile u8 preemption_hysteresis_pct =
+	10; /* Deadline diff threshold % */
 
 /* Task context stored in task storage map */
 struct task_ctx {
@@ -196,6 +211,22 @@ struct {
 	__type(value, struct cpu_ctx);
 	__uint(max_entries, 1);
 } cpu_ctx_stor SEC(".maps");
+
+/* Per-CPU running task deadline tracking for preemption */
+struct cpu_running_task {
+	u64		 deadline_vtime; /* Running task's virtual deadline */
+	u64		 vtime; /* Running task's virtual runtime */
+	s32		 pid; /* Running task's PID (for debugging) */
+	enum happy_queue queue; /* Running task's queue */
+	u64 preemption_count; /* Count of preemptions on this CPU */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct cpu_running_task);
+	__uint(max_entries, 1);
+} cpu_running_task SEC(".maps");
 
 /* Antistall tracking */
 struct {
@@ -435,6 +466,63 @@ static inline bool is_eligible(struct task_ctx *tctx, enum happy_queue queue)
 
 	/* Eligible if vruntime <= avg_vtime (task is owed CPU time) */
 	return tctx->vtime <= avg_vtime;
+}
+
+/*
+ * Check if enqueuing task should preempt running task.
+ *
+ * Preemption rules (following Linux EEVDF):
+ * 1. Task must be eligible (owed CPU time)
+ * 2. Task must have earlier deadline than running task
+ * 3. Queue priority is respected (LC > NORMAL > HOG)
+ */
+static inline bool should_preempt_running(struct task_struct *p,
+					  struct task_ctx *tctx, s32 cpu)
+{
+	struct cpu_running_task *running;
+
+	if (!deadline_preemption_enabled)
+		return false;
+
+	/* Get current running task on target CPU */
+	running = bpf_map_lookup_percpu_elem(&cpu_running_task, &zero_u32, cpu);
+	if (!running || running->pid == 0)
+		return false;
+
+	/* 1. Task must be eligible */
+	if (!is_eligible(tctx, tctx->queue)) {
+		__sync_fetch_and_add(&nr_preemptions_ineligible, 1);
+		return false;
+	}
+
+	/* 2. Check queue priority first */
+	if (tctx->queue < running->queue) {
+		/* Higher priority queue - can preempt regardless of deadline */
+		__sync_fetch_and_add(&nr_queue_priority_preemptions, 1);
+		return true;
+	} else if (tctx->queue > running->queue) {
+		/* Lower priority queue - cannot preempt */
+		return false;
+	}
+
+	/* 3. Same queue: compare deadlines (EEVDF rule) */
+	if (tctx->deadline_vtime < running->deadline_vtime) {
+		/* Add hysteresis to avoid ping-pong with similar deadlines */
+		u64 deadline_diff =
+			running->deadline_vtime - tctx->deadline_vtime;
+		u64 vslice_threshold = tctx->vslice / 10; /* 10% of slice */
+
+		if (deadline_diff < vslice_threshold) {
+			__sync_fetch_and_add(&nr_preemptions_skipped, 1);
+			return false;
+		}
+
+		__sync_fetch_and_add(&nr_same_queue_preemptions, 1);
+		return true;
+	}
+
+	__sync_fetch_and_add(&nr_preemptions_later_deadline, 1);
+	return false;
 }
 
 /* Calculate EWMA frequency: freq = alpha * (1/interval) + (1-alpha) * freq */
@@ -909,8 +997,10 @@ void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
 	u64		 dsq_id, slice, vtime_for_dsq;
 	u32		 llc_id = 0; /* Simplified: always use LLC 0 for now */
 	bool		 eligible;
+	s32		 target_cpu;
+	bool		 do_preempt = false;
 
-	tctx = lookup_task_ctx(p);
+	tctx			    = lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
@@ -930,6 +1020,12 @@ void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/* Check eligibility - is task owed CPU time? */
 	eligible = is_eligible(tctx, tctx->queue);
+
+	/* Check for deadline-based preemption */
+	target_cpu = scx_bpf_task_cpu(p);
+	if (eligible && target_cpu >= 0) {
+		do_preempt = should_preempt_running(p, tctx, target_cpu);
+	}
 
 	/*
 	 * EEVDF dispatch ordering:
@@ -966,6 +1062,23 @@ void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
 							    &zero_u32, cpu);
 		if (antistall && *antistall == SCX_DSQ_INVALID)
 			*antistall = dsq_id;
+	}
+
+	/* Perform preemption if needed */
+	if (do_preempt && target_cpu >= 0) {
+		scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT);
+		__sync_fetch_and_add(&nr_deadline_preemptions, 1);
+
+		/* Update running task's preemption count for throttling */
+		struct cpu_running_task *running = bpf_map_lookup_percpu_elem(
+			&cpu_running_task, &zero_u32, target_cpu);
+		if (running) {
+			running->preemption_count++;
+		}
+
+		if (debug)
+			bpf_printk("Preempting CPU %d for task %d", target_cpu,
+				   p->pid);
 	}
 }
 
@@ -1112,6 +1225,17 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 		scx_bpf_cpuperf_set(cpu, perf);
 	}
 
+	/* NEW: Track running task's deadline for preemption decisions */
+	struct cpu_running_task *running;
+
+	running = bpf_map_lookup_elem(&cpu_running_task, &zero_u32);
+	if (running) {
+		running->deadline_vtime = tctx->deadline_vtime;
+		running->vtime		= tctx->vtime;
+		running->pid		= p->pid;
+		running->queue		= tctx->queue;
+	}
+
 	/* NEW: Update queue EEVDF state - task is now running */
 	u32			  key = (u32)tctx->queue;
 	struct queue_eevdf_state *state =
@@ -1226,6 +1350,22 @@ void BPF_STRUCT_OPS(happy_stopping, struct task_struct *p, bool runnable)
 	tctx = lookup_task_ctx(p);
 	if (!tctx)
 		return;
+
+	/* Clear running task tracking */
+	struct cpu_running_task *running;
+
+	running = bpf_map_lookup_elem(&cpu_running_task, &zero_u32);
+	if (running && running->pid == p->pid) {
+		running->deadline_vtime = 0;
+		running->vtime		= 0;
+		running->pid		= 0;
+		running->queue		= HAPPY_QUEUE_MAX;
+
+		/* Reset preemption count periodically */
+		if (running->preemption_count > 10)
+			running->preemption_count =
+				running->preemption_count / 2;
+	}
 
 	/* Count preemptions (task still runnable but being stopped) */
 	if (runnable)

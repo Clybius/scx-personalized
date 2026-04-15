@@ -79,6 +79,13 @@ struct happy_stats {
 	u64 nr_eligible_dispatches; /* Dispatched as eligible */
 	u64 nr_ineligible_dispatches; /* Dispatched as ineligible */
 	u64 nr_deadline_expired; /* Tasks that exceeded deadline */
+	/* NEW: Deadline preemption statistics */
+	u64 nr_deadline_preemptions; /* Total preemptions triggered */
+	u64 nr_queue_priority_preemptions; /* Preemptions due to queue priority */
+	u64 nr_same_queue_preemptions; /* Preemptions within same queue */
+	u64 nr_preemptions_skipped; /* Skipped due to hysteresis */
+	u64 nr_preemptions_ineligible; /* Skipped because task not eligible */
+	u64 nr_preemptions_later_deadline; /* Skipped because later deadline */
 	/* Per-queue vtime tracking */
 	u64 lc_min_vtime; /* LC queue min vtime */
 	u64 lc_avg_vtime; /* LC queue weighted avg vtime */
