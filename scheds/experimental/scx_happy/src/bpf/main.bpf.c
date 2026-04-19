@@ -9,9 +9,11 @@
 #define __bpf__
 #include "../../../../scheds/include/scx/common.bpf.h"
 #include "../../../../scheds/include/scx/percpu.bpf.h"
+#include "../../../../scheds/include/lib/cleanup.bpf.h"
 #else
 #include <scx/common.bpf.h>
 #include <scx/percpu.bpf.h>
+#include <lib/cleanup.bpf.h>
 #endif
 
 #include <errno.h>
@@ -25,6 +27,8 @@
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
+
+extern unsigned CONFIG_HZ __kconfig;
 
 /* Maximum values */
 #define MAX_CPUS 1024
@@ -248,13 +252,21 @@ struct {
 	__uint(max_entries, 1);
 } cpu_running_task SEC(".maps");
 
-/* Antistall tracking */
+/* Antistall tracking - DSQ ID for each CPU */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, u64); /* Delayed DSQ ID */
 	__uint(max_entries, 1);
-} antistall_dsq SEC(".maps");
+} antistall_cpu_dsq SEC(".maps");
+
+/* Antistall tracking - max delay for each CPU */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u64); /* Delay in seconds */
+	__uint(max_entries, 1);
+} antistall_cpu_max_delay SEC(".maps");
 
 /* SMT sibling map */
 struct {
@@ -840,6 +852,84 @@ static inline u64 get_slice_for_queue(enum happy_queue queue)
 	}
 }
 
+static int get_delay_sec(struct task_struct *p, u64 jiffies_now)
+{
+	u64 runnable_at, delta_secs;
+	runnable_at = READ_ONCE(p->scx.runnable_at);
+	if (time_before(runnable_at, jiffies_now)) {
+		delta_secs = (jiffies_now - runnable_at) / CONFIG_HZ;
+	} else {
+		delta_secs = 0;
+	}
+	return delta_secs;
+}
+
+static void antistall_set(u64 dsq_id, u64 jiffies_now)
+{
+	struct task_struct *p;
+	int pass;
+
+	if (!dsq_id || !antistall_enabled)
+		return;
+
+	guard(rcu)();
+	bpf_for_each(scx_dsq, p, dsq_id, 0) {
+		u64 cur_delay = get_delay_sec(p, jiffies_now);
+
+		if (cur_delay <= antistall_sec)
+			return;
+
+#pragma unroll
+		for (pass = 0; pass < 2; ++pass) {
+			s32 cpu;
+
+			bpf_for(cpu, 0, MAX_CPUS) {
+				u64 *antistall_dsq, *delay;
+
+				if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+					continue;
+
+				antistall_dsq = bpf_map_lookup_percpu_elem(
+					&antistall_cpu_dsq, &zero_u32, cpu);
+				delay = bpf_map_lookup_percpu_elem(
+					&antistall_cpu_max_delay, &zero_u32, cpu);
+
+				if (!antistall_dsq || !delay)
+					continue;
+
+				if ((pass == 0 && *antistall_dsq == SCX_DSQ_INVALID) ||
+				    (pass != 0 && *delay < cur_delay)) {
+					*antistall_dsq = dsq_id;
+					*delay = cur_delay;
+					return;
+				}
+			}
+		}
+		return;
+	}
+}
+
+static void antistall_scan(void)
+{
+	u64 jiffies_now;
+	u32 llc_id = 0;
+	u64 dsq_id;
+
+	if (!antistall_enabled)
+		return;
+
+	jiffies_now = bpf_jiffies64();
+
+	dsq_id = get_dsq_for_queue(HAPPY_QUEUE_LC, llc_id);
+	antistall_set(dsq_id, jiffies_now);
+
+	dsq_id = get_dsq_for_queue(HAPPY_QUEUE_NORMAL, llc_id);
+	antistall_set(dsq_id, jiffies_now);
+
+	dsq_id = get_dsq_for_queue(HAPPY_QUEUE_HOG, llc_id);
+	antistall_set(dsq_id, jiffies_now);
+}
+
 /* Update task's EEVDF state on enqueue */
 static inline void update_eevdf_state(struct task_ctx *tctx,
 				      enum happy_queue queue)
@@ -970,10 +1060,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(happy_init)
 
 	/* Initialize antistall tracking */
 	for (i = 0; i < MAX_CPUS; i++) {
-		u64 *antistall = bpf_map_lookup_percpu_elem(&antistall_dsq,
-							    &zero_u32, i);
-		if (antistall)
-			*antistall = SCX_DSQ_INVALID;
+		u64 *antistall_dsq = bpf_map_lookup_percpu_elem(
+			&antistall_cpu_dsq, &zero_u32, i);
+		u64 *delay = bpf_map_lookup_percpu_elem(
+			&antistall_cpu_max_delay, &zero_u32, i);
+		if (antistall_dsq)
+			*antistall_dsq = SCX_DSQ_INVALID;
+		if (delay)
+			*delay = 0;
 	}
 
 	return 0;
@@ -1128,15 +1222,6 @@ void BPF_STRUCT_OPS(happy_enqueue, struct task_struct *p, u64 enq_flags)
 	/* Insert with appropriate vtime (deadline or vruntime) */
 	scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime_for_dsq, enq_flags);
 
-	/* Update antistall tracking if enabled */
-	if (antistall_enabled) {
-		s32  cpu       = scx_bpf_task_cpu(p);
-		u64 *antistall = bpf_map_lookup_percpu_elem(&antistall_dsq,
-							    &zero_u32, cpu);
-		if (antistall && *antistall == SCX_DSQ_INVALID)
-			*antistall = dsq_id;
-	}
-
 	/* Perform preemption if needed */
 	if (do_preempt && target_cpu >= 0) {
 		scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT);
@@ -1160,16 +1245,20 @@ void BPF_STRUCT_OPS(happy_dispatch, s32 cpu, struct task_struct *prev)
 	u32 llc_id = 0; /* Simplified */
 	u64 dsq_id;
 
-	/* Try antistall first */
+	/* Antistall: consume from flagged DSQ first */
 	if (antistall_enabled) {
-		u64 *antistall = bpf_map_lookup_elem(&antistall_dsq, &zero_u32);
-		if (antistall && *antistall != SCX_DSQ_INVALID) {
-			if (scx_bpf_dsq_move_to_local(*antistall, 0)) {
-				__sync_fetch_and_add(&nr_antistall_dispatches,
-						     1);
-				*antistall = SCX_DSQ_INVALID;
+		u64 *antistall_dsq = bpf_map_lookup_elem(&antistall_cpu_dsq, &zero_u32);
+		u64 *delay = bpf_map_lookup_elem(&antistall_cpu_max_delay, &zero_u32);
+
+		if (antistall_dsq && *antistall_dsq != SCX_DSQ_INVALID) {
+			if (scx_bpf_dsq_move_to_local(*antistall_dsq, 0)) {
+				__sync_fetch_and_add(&nr_antistall_dispatches, 1);
 				return;
 			}
+			/* DSQ empty or consumed - reset flag */
+			*antistall_dsq = SCX_DSQ_INVALID;
+			if (delay)
+				*delay = 0;
 		}
 	}
 
@@ -1249,6 +1338,9 @@ void BPF_STRUCT_OPS(happy_tick, struct task_struct *p)
 			tctx->cpu_window_runtime = 0;
 		}
 	}
+
+	/* Periodic antistall scan */
+	antistall_scan();
 }
 
 void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
