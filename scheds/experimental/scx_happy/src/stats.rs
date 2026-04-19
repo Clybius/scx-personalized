@@ -2,11 +2,12 @@
 //
 // Copyright (c) 2024 scx_happy authors
 
-use scx_stats::{Meta, Stat};
+use scx_stats_derive::stat_doc;
+use scx_stats_derive::Stats;
 use serde::{Deserialize, Serialize};
 
 #[stat_doc]
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[serde(rename_all = "snake_case")]
 pub struct HappyMetrics {
     #[stat(desc = "Number of LC queue dispatches")]

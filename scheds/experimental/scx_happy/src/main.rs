@@ -12,7 +12,7 @@ use scx_utils::{
 };
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
+
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
+mod stats;
+pub use stats::HappyMetrics;
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -240,11 +242,66 @@ impl TaskClassifier {
     }
 
     fn detect_all(&mut self) {
-        self.detect_scx_turbo();
-        self.detect_steam_games();
-        self.detect_de_tasks();
-        self.detect_input_tasks();
-        self.detect_audio_tasks();
+        self.scx_turbo_tgids.clear();
+        self.steam_tgids.clear();
+        self.de_tgids.clear();
+        self.input_tgids.clear();
+        self.audio_tgids.clear();
+
+        let Ok(entries) = fs::read_dir("/proc") else { return };
+
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else { continue };
+            let Ok(pid) = name.parse::<u32>() else { continue };
+
+            // Fast path: read comm (small file)
+            let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", pid)) else { continue };
+            let comm = comm.trim().to_lowercase();
+
+            // Classify by comm patterns - DE
+            let de_patterns = ["kwin", "mutter", "compiz", "compositor", "wayfire",
+                              "sway", "river", "dwl", "hyprland", "i3", "awesome"];
+            for p in de_patterns {
+                if comm.contains(p) {
+                    self.de_tgids.insert(pid);
+                }
+            }
+
+            // Classify by comm patterns - Input
+            let input_patterns = [
+                "fcitx", "fcitx5",
+                "ibus", "ibus-daemon", "ibus-engine",
+                "ksoftirqd",
+                "input-",
+                "evdev",
+            ];
+            for p in input_patterns {
+                if comm.contains(p) {
+                    self.input_tgids.insert(pid);
+                }
+            }
+
+            // Classify by comm patterns - Audio
+            let audio_patterns = ["pipewire", "pulseaudio", "jackd", "alsa"];
+            for p in audio_patterns {
+                if comm.contains(p) {
+                    self.audio_tgids.insert(pid);
+                }
+            }
+
+            // Slow path: read environ only for Steam/SCX_TURBO detection
+            let needs_environ = comm.contains("wine") || comm.contains("game") || comm.is_empty();
+            if needs_environ {
+                if let Ok(environ) = fs::read_to_string(format!("/proc/{}/environ", pid)) {
+                    if environ.contains("SCX_TURBO=1") {
+                        self.scx_turbo_tgids.insert(pid);
+                    }
+                    if environ.contains("SteamGameId=") || environ.contains("STEAM_GAME=") {
+                        self.steam_tgids.insert(pid);
+                    }
+                }
+            }
+        }
     }
 
     /// Detect all tasks and return true if any changes were detected
@@ -271,251 +328,6 @@ impl TaskClassifier {
         }
 
         changed
-    }
-
-    fn detect_scx_turbo(&mut self) {
-        self.scx_turbo_tgids.clear();
-
-        let entries = match fs::read_dir("/proc") {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let filename = entry.file_name();
-            let name = match filename.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-
-            // Check if it's a PID directory
-            let pid: u32 = match name.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Read environ file
-            let environ_path = format!("/proc/{}/environ", pid);
-            let mut content = String::new();
-
-            if let Ok(mut file) = fs::File::open(&environ_path) {
-                if file.read_to_string(&mut content).is_ok() {
-                    // Check for SCX_TURBO=1
-                    if content.contains("SCX_TURBO=1") {
-                        self.scx_turbo_tgids.insert(pid);
-                        debug!("Detected SCX_TURBO task: {}", pid);
-                    }
-                }
-            }
-        }
-    }
-
-    fn detect_steam_games(&mut self) {
-        self.steam_tgids.clear();
-
-        let entries = match fs::read_dir("/proc") {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let filename = entry.file_name();
-            let name = match filename.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-
-            let pid: u32 = match name.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Read environ file for SteamGameId
-            let environ_path = format!("/proc/{}/environ", pid);
-            let mut content = String::new();
-
-            if let Ok(mut file) = fs::File::open(&environ_path) {
-                if file.read_to_string(&mut content).is_ok() {
-                    if content.contains("SteamGameId=") || content.contains("STEAM_GAME=") {
-                        self.steam_tgids.insert(pid);
-                        debug!("Detected Steam game: {}", pid);
-                    }
-                }
-            }
-
-            // Also check comm for wine/game patterns
-            let comm_path = format!("/proc/{}/comm", pid);
-            if let Ok(comm) = fs::read_to_string(&comm_path) {
-                let comm = comm.trim();
-                if comm.contains("wine") || comm.contains("Game") || comm.contains("game") {
-                    self.steam_tgids.insert(pid);
-                    debug!("Detected game process by comm: {}", pid);
-                }
-            }
-        }
-    }
-
-    fn detect_de_tasks(&mut self) {
-        self.de_tgids.clear();
-
-        let de_patterns = [
-            "kwin",
-            "mutter",
-            "compiz",
-            "compositor",
-            "wayfire",
-            "sway",
-            "river",
-            "dwl",
-            "hyprland",
-            "i3",
-            "awesome",
-        ];
-
-        let entries = match fs::read_dir("/proc") {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let filename = entry.file_name();
-            let name = match filename.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-
-            let pid: u32 = match name.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let comm_path = format!("/proc/{}/comm", pid);
-            if let Ok(comm) = fs::read_to_string(&comm_path) {
-                let comm = comm.trim().to_lowercase();
-                for pattern in &de_patterns {
-                    if comm.contains(pattern) {
-                        self.de_tgids.insert(pid);
-                        debug!("Detected DE component: {} ({})", pid, comm);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    fn detect_input_tasks(&mut self) {
-        self.input_tgids.clear();
-
-        // Input event handling threads (distinct from DE/compositors)
-        // These handle actual mouse & keyboard events at a low level
-        let input_patterns = [
-            // Input method editors (IMEs) - handle keyboard input transformation
-            "fcitx",
-            "fcitx5",
-            "ibus",
-            "ibus-daemon",
-            "ibus-engine",
-            // ksoftirqd handles input interrupts among other softirq processing
-            "ksoftirqd",
-            // Direct input event handling threads (may exist in some setups)
-            "input-events",
-            "input-thread",
-            "input-worker",
-            // Evdev handling patterns
-            "evdev-process",
-            "evdev-worker",
-        ];
-
-        let entries = match fs::read_dir("/proc") {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let filename = entry.file_name();
-            let name = match filename.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-
-            let pid: u32 = match name.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let comm_path = format!("/proc/{}/comm", pid);
-            if let Ok(comm) = fs::read_to_string(&comm_path) {
-                let comm = comm.trim().to_lowercase();
-                for pattern in &input_patterns {
-                    if comm.contains(pattern) {
-                        self.input_tgids.insert(pid);
-                        debug!("Detected input task: {} ({})", pid, comm);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    fn detect_audio_tasks(&mut self) {
-        self.audio_tgids.clear();
-
-        let audio_patterns = ["pipewire", "pulseaudio", "jackd", "alsa", "snd"];
-
-        let entries = match fs::read_dir("/proc") {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let filename = entry.file_name();
-            let name = match filename.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-
-            let pid: u32 = match name.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let comm_path = format!("/proc/{}/comm", pid);
-            if let Ok(comm) = fs::read_to_string(&comm_path) {
-                let comm = comm.trim().to_lowercase();
-                for pattern in &audio_patterns {
-                    if comm.contains(pattern) {
-                        self.audio_tgids.insert(pid);
-                        debug!("Detected audio task: {} ({})", pid, comm);
-                        break;
-                    }
-                }
-            }
-        }
     }
 
     fn print_stats(&self) {

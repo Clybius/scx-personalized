@@ -387,14 +387,8 @@ int happy_set_domain_cpu(struct domain_cpu_arg *input)
 /* Helper: lookup or create task context */
 static __always_inline struct task_ctx *lookup_task_ctx(struct task_struct *p)
 {
-	struct task_ctx *tctx;
-
-	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
-	if (!tctx) {
-		tctx = bpf_task_storage_get(&task_ctx_stor, p, 0,
-					    BPF_LOCAL_STORAGE_GET_F_CREATE);
-	}
-	return tctx;
+	return bpf_task_storage_get(&task_ctx_stor, p, 0,
+				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 }
 
 /* Helper: convert prio to nice (same as prio_to_nice macro) */
@@ -1290,22 +1284,6 @@ void BPF_STRUCT_OPS(happy_tick, struct task_struct *p)
 	if (!tctx)
 		return;
 
-	/* Yield-based preemption per queue thresholds */
-	switch (tctx->queue) {
-	case HAPPY_QUEUE_HOG:
-		/* HOG tasks yield to any LC or NORMAL task */
-		/* Check if higher priority queues have waiting tasks */
-		break;
-	case HAPPY_QUEUE_NORMAL:
-		/* NORMAL tasks yield only to LC tasks */
-		break;
-	case HAPPY_QUEUE_LC:
-		/* LC tasks don't yield based on queue priority */
-		break;
-	default:
-		break;
-	}
-
 	/* CPU tracking for HOG demotion - only for NORMAL tasks */
 	if (tctx->queue == HAPPY_QUEUE_NORMAL) {
 		now = bpf_ktime_get_ns();
@@ -1406,10 +1384,6 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 	struct queue_eevdf_state *state =
 		bpf_map_lookup_elem(&queue_eevdf_states, &key);
 	if (state) {
-		if (tctx->weight == 0)
-			tctx->weight =
-				calc_weight_from_virt_nice(tctx->virt_nice);
-
 		state->total_weight += tctx->weight;
 		state->nr_tasks++;
 	}
@@ -1541,9 +1515,6 @@ void BPF_STRUCT_OPS(happy_stopping, struct task_struct *p, bool runnable)
 	tctx->exec_runtime = delta;
 
 	/* NEW: WFQ-style vtime update - vruntime += delta * NICE_0_WEIGHT / weight */
-	if (tctx->weight == 0)
-		tctx->weight = calc_weight_from_virt_nice(tctx->virt_nice);
-
 	vdelta = delta * NICE_0_WEIGHT / tctx->weight;
 	tctx->vtime += vdelta;
 

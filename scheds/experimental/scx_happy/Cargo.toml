@@ -13,6 +13,7 @@ libbpf-rs = "=0.26.2"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 scx_stats = { path = "../../../rust/scx_stats" }
+scx_stats_derive = { path = "../../../rust/scx_stats/scx_stats_derive" }
 scx_utils = { path = "../../../rust/scx_utils" }
 
 [build-dependencies]

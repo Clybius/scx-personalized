@@ -3816,6 +3816,7 @@ dependencies = [
  "log",
  "scx_cargo",
  "scx_stats",
+ "scx_stats_derive",
  "scx_utils",
  "serde",
 ]
