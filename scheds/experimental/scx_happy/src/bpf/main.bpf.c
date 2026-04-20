@@ -76,6 +76,13 @@ const volatile u64 hog_min_sleep_duration_ns =
 const volatile u32 hog_min_sleep_count =
 	3; /* Min sleep cycles before promotion */
 
+/* ========== Latency Criticality Configuration ========== */
+const volatile bool lat_cri_enabled = true;
+const volatile u32 lat_cri_weight_pct = 60;
+const volatile bool lat_cri_inheritance = true;
+const volatile u16 lat_cri_threshold_high = 768;
+const volatile u16 lat_cri_threshold_low = 256;
+
 /* Dynamic adjustment flags */
 #define HAPPY_FLAG_IS_SYNC_WAKEUP 0x00000001 /* Woken via sync wakeup */
 #define HAPPY_FLAG_IS_WAKEUP 0x00000002 /* Recently woken */
@@ -125,6 +132,11 @@ volatile u64 nr_preemptions_later_deadline;
 /* NEW: Lag decay statistics */
 volatile u64	   nr_hog_sleep_decayed; /* Times HOG sleep was decayed */
 volatile u64	   nr_hog_promotion_checks; /* Promotion eligibility checks */
+
+/* ========== Latency Criticality Statistics Counters ========== */
+volatile u64 nr_lat_cri_calculations;
+volatile u64 nr_high_lat_cri_tasks;
+volatile u64 nr_lat_cri_inherited;
 
 const volatile u32 debug    = 0;
 const u32	   zero_u32 = 0;
@@ -177,6 +189,12 @@ struct task_ctx {
 	u64  total_sleep_ns; /* Accumulated sleep time while HOG */
 	u32  hog_sleep_count; /* Number of sleeps while HOG */
 	bool can_promote; /* Flag: eligible for promotion to NORMAL */
+
+	/* ========== Latency Criticality Fields ========== */
+	u16 lat_cri;              /* Raw latency criticality value */
+	u16 normalized_lat_cri;   /* Normalized to [0, 1024] scale */
+	u16 lat_cri_waker;        /* Inherited from task that woke this one */
+	u16 lat_cri_wakee;        /* Inherited from tasks this one has woken */
 };
 
 /* Per-task storage map */
@@ -293,6 +311,38 @@ struct {
 
 /* Global vtime clock */
 static u64 vtime_now;
+
+/* ========== System-wide Latency Criticality State ========== */
+
+/* Per-CPU tracking for lat_cri aggregation */
+struct cpu_lat_cri_state {
+	u32 max_lat_cri;       /* Max lat_cri seen on this CPU this interval */
+	u64 sum_lat_cri;       /* Sum for average calculation */
+	u32 nr_samples;        /* Number of samples this interval */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct cpu_lat_cri_state);
+	__uint(max_entries, 1);
+} cpu_lat_cri_stor SEC(".maps");
+
+/* System-wide state for lat_cri normalization */
+struct happy_sys_stat {
+	u64 last_update_ns;
+	u32 max_lat_cri;
+	u32 avg_lat_cri;
+	u64 sum_lat_cri;
+	u32 nr_samples;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct happy_sys_stat);
+	__uint(max_entries, 1);
+} sys_stat_stor SEC(".maps");
 
 /* Helper: get domain cpumask for a queue */
 static inline const struct cpumask *get_domain_cpumask(enum happy_queue queue)
@@ -583,6 +633,328 @@ static inline u64 decay_accumulated_time(u64 value)
 	return value >> 2;
 }
 
+/* ========== Latency Criticality Calculation Functions ========== */
+
+/*
+ * Integer log2 approximation for BPF.
+ * Returns floor(log2(v)) for v > 0, or 0 for v == 0.
+ */
+static __always_inline u32 log2_approx(u64 v)
+{
+	if (v == 0)
+		return 0;
+	u32 log = 0;
+	while (v >>= 1)
+		log++;
+	return log;
+}
+
+/*
+ * Calculate wait factor for lat_cri.
+ * Higher wait_freq = task sleeps often = likely waiting for events = latency critical.
+ */
+static u64 calc_lat_cri_wait_factor(struct task_ctx *tctx)
+{
+	u64 freq = tctx->wait_freq;
+	if (freq > HAPPY_LAT_CRI_FREQ_MAX)
+		freq = HAPPY_LAT_CRI_FREQ_MAX;
+	return freq + 1;
+}
+
+/*
+ * Calculate wake factor for lat_cri.
+ * Higher wake_freq = task wakes others = producer in chain = latency critical.
+ */
+static u64 calc_lat_cri_wake_factor(struct task_ctx *tctx)
+{
+	u64 freq = tctx->wake_freq;
+	if (freq > HAPPY_LAT_CRI_FREQ_MAX)
+		freq = HAPPY_LAT_CRI_FREQ_MAX;
+	return freq + 1;
+}
+
+/*
+ * Calculate reverse runtime factor for lat_cri.
+ * Shorter runtime = more latency critical (quick interactive burst).
+ */
+static u64 calc_lat_cri_reverse_runtime_factor(struct task_ctx *tctx)
+{
+	u64 runtime = tctx->avg_runtime_ns;
+
+	if (runtime == 0)
+		return HAPPY_LAT_CRI_SCALE;
+
+	if (HAPPY_LAT_CRI_RUNTIME_MAX_NS > runtime) {
+		u64 delta = HAPPY_LAT_CRI_RUNTIME_MAX_NS - runtime;
+		return (delta / lc_slice_ns) + 1;
+	}
+	return 1;
+}
+
+/*
+ * Calculate context-aware weight boost for lat_cri.
+ */
+static u64 calc_lat_cri_weight_factor(struct task_struct *p, struct task_ctx *tctx)
+{
+	u64 weight_boost = 1;
+
+	if (tctx->flags & HAPPY_FLAG_IS_WAKEUP)
+		weight_boost += HAPPY_LC_WEIGHT_BOOST_WAKEUP;
+
+	if (tctx->flags & HAPPY_FLAG_IS_SYNC_WAKEUP)
+		weight_boost += HAPPY_LC_WEIGHT_BOOST_SYNC;
+
+	if (tctx->flags & HAPPY_FLAG_WOKEN_BY_IRQ)
+		weight_boost += HAPPY_LC_WEIGHT_BOOST_IRQ;
+
+	if (p->flags & PF_KTHREAD)
+		weight_boost += HAPPY_LC_WEIGHT_BOOST_KTHREAD;
+
+	return tctx->weight * weight_boost + 1;
+}
+
+/*
+ * Calculate raw latency criticality using lavd-style formula.
+ */
+static void calc_lat_cri(struct task_struct *p, struct task_ctx *tctx)
+{
+	u64 wait_ft, wake_ft, runtime_ft, weight_ft;
+	u64 log_wwf, lat_cri;
+
+	wait_ft = calc_lat_cri_wait_factor(tctx);
+	wake_ft = calc_lat_cri_wake_factor(tctx);
+	runtime_ft = calc_lat_cri_reverse_runtime_factor(tctx);
+	weight_ft = calc_lat_cri_weight_factor(p, tctx);
+
+	log_wwf = log2_approx(wait_ft * wake_ft);
+	lat_cri = log_wwf + log2_approx(runtime_ft * weight_ft);
+
+	lat_cri = lat_cri * lat_cri;
+
+	/* Optional waker/wakee inheritance propagation */
+	if (lat_cri_inheritance) {
+		u64 lat_cri_giver = (u64)tctx->lat_cri_waker + (u64)tctx->lat_cri_wakee;
+
+		if (lat_cri_giver > (2 * lat_cri)) {
+			u64 giver_inh = (lat_cri_giver - (2 * lat_cri)) >> HAPPY_LC_INH_GIVER_SHIFT;
+			u64 receiver_max = lat_cri >> HAPPY_LC_INH_RECEIVER_SHIFT;
+			u64 inherited = giver_inh < receiver_max ? giver_inh : receiver_max;
+			lat_cri += inherited;
+
+			if (inherited > 0)
+				__sync_fetch_and_add(&nr_lat_cri_inherited, 1);
+		}
+
+		tctx->lat_cri_waker = 0;
+		tctx->lat_cri_wakee = 0;
+	}
+
+	tctx->lat_cri = (u16)(lat_cri < (u64)65535 ? lat_cri : (u64)65535);
+	__sync_fetch_and_add(&nr_lat_cri_calculations, 1);
+}
+
+/*
+ * Normalize lat_cri to [0, 1024] scale.
+ */
+static u16 normalize_lat_cri(u16 lat_cri)
+{
+	struct happy_sys_stat *stat;
+	u32 key = 0;
+	u32 max;
+
+	stat = bpf_map_lookup_elem(&sys_stat_stor, &key);
+	if (!stat)
+		return 0;
+
+	max = stat->max_lat_cri;
+
+	if (max == 0)
+		return 0;
+	if (lat_cri >= max)
+		return HAPPY_LAT_CRI_SCALE;
+
+	return (u16)(((u64)lat_cri << HAPPY_LAT_CRI_SHIFT) / max);
+}
+
+/*
+ * Update per-CPU lat_cri tracking for system-wide aggregation.
+ */
+static void update_cpu_lat_cri_tracking(struct task_ctx *tctx)
+{
+	struct cpu_lat_cri_state *cpuc;
+	u32 key = 0;
+
+	cpuc = bpf_map_lookup_elem(&cpu_lat_cri_stor, &key);
+	if (!cpuc)
+		return;
+
+	if (tctx->lat_cri > cpuc->max_lat_cri)
+		cpuc->max_lat_cri = tctx->lat_cri;
+
+	cpuc->sum_lat_cri += tctx->lat_cri;
+	cpuc->nr_samples++;
+}
+
+/*
+ * Aggregate per-CPU stats to system-wide (called periodically in tick).
+ */
+static void aggregate_sys_lat_cri(void)
+{
+	struct happy_sys_stat *stat;
+	u32 max_lat_cri = 0;
+	u64 sum_lat_cri = 0;
+	u32 nr_samples = 0;
+	u32 key = 0;
+	int cpu;
+
+	stat = bpf_map_lookup_elem(&sys_stat_stor, &key);
+	if (!stat)
+		return;
+
+	bpf_for(cpu, 0, MAX_CPUS) {
+		struct cpu_lat_cri_state *cpuc;
+
+		cpuc = bpf_map_lookup_percpu_elem(&cpu_lat_cri_stor, &zero_u32, cpu);
+		if (!cpuc)
+			continue;
+
+		if (cpuc->max_lat_cri > max_lat_cri)
+			max_lat_cri = cpuc->max_lat_cri;
+
+		sum_lat_cri += cpuc->sum_lat_cri;
+		nr_samples += cpuc->nr_samples;
+
+		cpuc->max_lat_cri = 0;
+		cpuc->sum_lat_cri = 0;
+		cpuc->nr_samples = 0;
+	}
+
+	if (nr_samples > 0) {
+		u32 new_avg = (u32)(sum_lat_cri / nr_samples);
+		stat->avg_lat_cri = (stat->avg_lat_cri * 7 + new_avg) / 8;
+	}
+
+	if (max_lat_cri > 0) {
+		stat->max_lat_cri = (stat->max_lat_cri * 7 + max_lat_cri) / 8;
+	}
+
+	stat->last_update_ns = bpf_ktime_get_ns();
+}
+
+/*
+ * Map normalized_lat_cri [0, 1024] to virt_nice adjustment.
+ * Higher normalized_lat_cri = more latency critical = lower (better) virt_nice.
+ * High lat_cri tasks can be promoted to LC range regardless of base_queue.
+ */
+static s16 lat_cri_to_virt_nice(struct task_ctx *tctx, s16 base_virt_nice)
+{
+	u16 norm_lat = tctx->normalized_lat_cri;
+	s16 min_nice, max_nice;
+	s16 range, adjustment, result;
+	bool can_promote_to_lc = (norm_lat >= lat_cri_threshold_high);
+
+	switch (tctx->base_queue) {
+	case HAPPY_QUEUE_LC:
+		min_nice = HAPPY_LC_MIN_VIRT_NICE;
+		max_nice = HAPPY_LC_MAX_VIRT_NICE;
+		break;
+	case HAPPY_QUEUE_NORMAL:
+		if (can_promote_to_lc) {
+			min_nice = HAPPY_LC_MIN_VIRT_NICE;
+			max_nice = HAPPY_LC_MAX_VIRT_NICE;
+		} else {
+			min_nice = HAPPY_NORMAL_MIN_VIRT_NICE;
+			max_nice = HAPPY_NORMAL_MAX_VIRT_NICE;
+		}
+		break;
+	case HAPPY_QUEUE_HOG:
+		if (can_promote_to_lc) {
+			min_nice = HAPPY_LC_MIN_VIRT_NICE;
+			max_nice = HAPPY_LC_MAX_VIRT_NICE;
+		} else {
+			min_nice = HAPPY_NORMAL_MIN_VIRT_NICE;
+			max_nice = HAPPY_HOG_MAX_VIRT_NICE;
+		}
+		break;
+	default:
+		return base_virt_nice;
+	}
+
+	range = max_nice - min_nice;
+	adjustment = (s16)(((u64)norm_lat * range) >> HAPPY_LAT_CRI_SHIFT);
+	result = max_nice - adjustment;
+
+	if (result < min_nice)
+		result = min_nice;
+	if (result > max_nice)
+		result = max_nice;
+
+	return result;
+}
+
+/* Forward declaration */
+static s16 smooth_virt_nice_transition(struct task_ctx *tctx, s16 target);
+
+/*
+ * Blend normalized_lat_cri with existing dynamic_score for virt_nice.
+ * High lat_cri can promote to LC range via lat_cri_to_virt_nice.
+ */
+static s16 calc_blended_virt_nice(struct task_struct *p, struct task_ctx *tctx)
+{
+	s16 lat_nice, score_nice, blended;
+	u32 weight = lat_cri_weight_pct;
+	bool can_promote_to_lc = (tctx->normalized_lat_cri >= lat_cri_threshold_high);
+
+	lat_nice = lat_cri_to_virt_nice(tctx, tctx->base_virt_nice);
+
+	s16 base = tctx->base_virt_nice;
+	s16 min_nice, max_nice;
+
+	switch (tctx->base_queue) {
+	case HAPPY_QUEUE_LC:
+		min_nice = HAPPY_LC_MIN_VIRT_NICE;
+		max_nice = HAPPY_LC_MAX_VIRT_NICE;
+		break;
+	case HAPPY_QUEUE_NORMAL:
+		if (can_promote_to_lc) {
+			min_nice = HAPPY_LC_MIN_VIRT_NICE;
+			max_nice = HAPPY_LC_MAX_VIRT_NICE;
+		} else {
+			min_nice = HAPPY_NORMAL_MIN_VIRT_NICE;
+			max_nice = HAPPY_NORMAL_MAX_VIRT_NICE;
+		}
+		break;
+	case HAPPY_QUEUE_HOG:
+		if (can_promote_to_lc) {
+			min_nice = HAPPY_LC_MIN_VIRT_NICE;
+			max_nice = HAPPY_LC_MAX_VIRT_NICE;
+		} else if (tctx->dynamic_score > interactive_threshold) {
+			s16 promotion = ((tctx->dynamic_score - interactive_threshold) * 10) /
+					(1000 - interactive_threshold);
+			score_nice = HAPPY_HOG_MIN_VIRT_NICE - promotion;
+			if (score_nice < HAPPY_NORMAL_MIN_VIRT_NICE)
+				score_nice = HAPPY_NORMAL_MIN_VIRT_NICE;
+			blended = (lat_nice * weight + score_nice * (100 - weight)) / 100;
+			return smooth_virt_nice_transition(tctx, blended);
+		} else {
+			min_nice = HAPPY_NORMAL_MIN_VIRT_NICE;
+			max_nice = HAPPY_HOG_MAX_VIRT_NICE;
+		}
+		break;
+	default:
+		return base;
+	}
+
+	{
+		s16 range = max_nice - min_nice;
+		score_nice = max_nice - (s16)((tctx->dynamic_score * range) / 1000);
+	}
+
+	blended = (lat_nice * weight + score_nice * (100 - weight)) / 100;
+
+	return smooth_virt_nice_transition(tctx, blended);
+}
+
 /*
  * Check if a HOG task should be promoted back to NORMAL
  * Based on:
@@ -754,37 +1126,31 @@ static s16 calc_dynamic_virt_nice(struct task_struct *p, struct task_ctx *tctx)
 	s16 min_nice, max_nice, target;
 	s16 range;
 
-	/* Get queue boundaries */
 	switch (tctx->base_queue) {
 	case HAPPY_QUEUE_LC:
-		min_nice = HAPPY_LC_MIN_VIRT_NICE; /* -50 */
-		max_nice = HAPPY_LC_MAX_VIRT_NICE; /* -20 */
+		min_nice = HAPPY_LC_MIN_VIRT_NICE; /* -20 */
+		max_nice = HAPPY_LC_MAX_VIRT_NICE; /* -10 */
 		break;
 	case HAPPY_QUEUE_NORMAL:
-		min_nice = HAPPY_NORMAL_MIN_VIRT_NICE; /* -19 */
-		max_nice = HAPPY_NORMAL_MAX_VIRT_NICE; /* 10 */
+		min_nice = HAPPY_NORMAL_MIN_VIRT_NICE; /* -9 */
+		max_nice = HAPPY_NORMAL_MAX_VIRT_NICE; /* 5 */
 		break;
 	case HAPPY_QUEUE_HOG:
-		/* HOG tasks: high score can promote to NORMAL */
-		min_nice = HAPPY_HOG_MIN_VIRT_NICE; /* 11 */
-		max_nice = HAPPY_HOG_MAX_VIRT_NICE; /* 49 */
+		min_nice = HAPPY_HOG_MIN_VIRT_NICE; /* 6 */
+		max_nice = HAPPY_HOG_MAX_VIRT_NICE; /* 19 */
 		break;
 	default:
 		return base;
 	}
 
-	/* Calculate score */
-	score		    = calc_interactive_score(p, tctx);
+	score = calc_interactive_score(p, tctx);
 	tctx->dynamic_score = score;
 
-	/* Map score (0-1000) to virt_nice range */
 	if (tctx->base_queue == HAPPY_QUEUE_HOG) {
-		/* HOG tasks: high score can promote to NORMAL */
 		if (score > interactive_threshold) {
-			/* Promote toward NORMAL range */
-			s16 promotion = ((score - interactive_threshold) * 15) /
+			s16 promotion = ((score - interactive_threshold) * 10) /
 					(1000 - interactive_threshold);
-			target	      = HAPPY_HOG_MIN_VIRT_NICE - promotion;
+			target = HAPPY_HOG_MIN_VIRT_NICE - promotion;
 			if (target < HAPPY_NORMAL_MIN_VIRT_NICE)
 				target = HAPPY_NORMAL_MIN_VIRT_NICE;
 		} else {
@@ -982,6 +1348,12 @@ static void init_task(struct task_struct *p, struct task_ctx *tctx)
 	tctx->deadline_vtime = vtime_now;
 	tctx->weight	     = calc_weight_from_virt_nice(tctx->virt_nice);
 	tctx->vslice	     = 0;
+
+	/* ========== Initialize lat_cri fields ========== */
+	tctx->lat_cri = 0;
+	tctx->normalized_lat_cri = 0;
+	tctx->lat_cri_waker = 0;
+	tctx->lat_cri_wakee = 0;
 
 	/* Count classified tasks (non-default queue) */
 	if (tctx->queue != HAPPY_QUEUE_NORMAL)
@@ -1317,6 +1689,20 @@ void BPF_STRUCT_OPS(happy_tick, struct task_struct *p)
 		}
 	}
 
+	/* ========== Aggregate lat_cri stats ========== */
+	if (lat_cri_enabled) {
+		struct happy_sys_stat *stat;
+		u32 key = 0;
+
+		stat = bpf_map_lookup_elem(&sys_stat_stor, &key);
+		if (stat) {
+			now = bpf_ktime_get_ns();
+			if (now - stat->last_update_ns >= HAPPY_SYS_STAT_INTERVAL_NS) {
+				aggregate_sys_lat_cri();
+			}
+		}
+	}
+
 	/* Periodic antistall scan */
 	antistall_scan();
 }
@@ -1404,9 +1790,23 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 		delta = now - tctx->last_recalc_ns;
 
 		if (delta >= adjust_interval_ns) {
-			s16 target = calc_dynamic_virt_nice(p, tctx);
-			s16 new_nice =
-				smooth_virt_nice_transition(tctx, target);
+			/* Recalculate lat_cri if enabled */
+			if (lat_cri_enabled) {
+				calc_lat_cri(p, tctx);
+				tctx->normalized_lat_cri = normalize_lat_cri(tctx->lat_cri);
+			}
+
+			/* Calculate dynamic_score */
+			tctx->dynamic_score = calc_interactive_score(p, tctx);
+
+			/* Blend lat_cri and dynamic_score for virt_nice */
+			s16 target;
+			if (lat_cri_enabled) {
+				target = calc_blended_virt_nice(p, tctx);
+			} else {
+				target = calc_dynamic_virt_nice(p, tctx);
+			}
+			s16 new_nice = smooth_virt_nice_transition(tctx, target);
 
 			/* Apply change if different */
 			if (new_nice != tctx->virt_nice) {
@@ -1470,10 +1870,9 @@ void BPF_STRUCT_OPS(happy_running, struct task_struct *p)
 
 				if (debug)
 					bpf_printk(
-						"Task %d: virt_nice -> %d (score %u, weight %llu)",
-						p->pid, new_nice,
-						tctx->dynamic_score,
-						tctx->weight);
+						"Task %d: virt_nice -> %d (lat_cri=%u, score=%u, weight=%llu)",
+						p->pid, new_nice, tctx->normalized_lat_cri,
+						tctx->dynamic_score, tctx->weight);
 			}
 		}
 	}
@@ -1679,6 +2078,20 @@ void BPF_STRUCT_OPS(happy_runnable, struct task_struct *p, u64 enq_flags)
 		}
 	}
 
+	/* ========== Calculate lat_cri on runnable ========== */
+	if (lat_cri_enabled) {
+		calc_lat_cri(p, tctx);
+		tctx->normalized_lat_cri = normalize_lat_cri(tctx->lat_cri);
+		update_cpu_lat_cri_tracking(tctx);
+
+		if (tctx->normalized_lat_cri > lat_cri_threshold_high)
+			__sync_fetch_and_add(&nr_high_lat_cri_tasks, 1);
+
+		if (debug)
+			bpf_printk("Task %d: lat_cri=%u, normalized=%u",
+				   p->pid, tctx->lat_cri, tctx->normalized_lat_cri);
+	}
+
 	/* Track how often this task becomes runnable (wait frequency inverse) */
 	if (tctx->last_quiescent_ns > 0) {
 		interval	= now - tctx->last_quiescent_ns;
@@ -1733,6 +2146,12 @@ void BPF_STRUCT_OPS(happy_runnable, struct task_struct *p, u64 enq_flags)
 			waker_tctx->wake_freq =
 				calc_avg_freq(waker_tctx->wake_freq, interval);
 		}
+	}
+
+	/* ========== lat_cri inheritance ========== */
+	if (lat_cri_enabled && lat_cri_inheritance && waker_tctx) {
+		tctx->lat_cri_waker = waker_tctx->lat_cri;
+		waker_tctx->lat_cri_wakee = tctx->lat_cri;
 	}
 }
 

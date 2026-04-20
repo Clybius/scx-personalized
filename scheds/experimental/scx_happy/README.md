@@ -4,23 +4,40 @@ This is a single user-defined scheduler used within [`sched_ext`](https://github
 
 ## Overview
 
-`scx_happy` is a latency-aware scheduler that implements a sophisticated hybrid scheduling algorithm combining **EEVDF (Earliest Eligible Virtual Deadline First)** with **WFQ (Weighted Fair Queueing)**. Its core innovation is a **virtual niceness system** that extends the kernel's standard nice values from the range -20 to +19 to an expanded range of -50 to +49, enabling finer-grained priority differentiation.
+`scx_happy` is a latency-aware scheduler that implements a sophisticated hybrid scheduling algorithm combining **EEVDF (Earliest Eligible Virtual Deadline First)** with **WFQ (Weighted Fair Queueing)**. Its core innovation is a **virtual niceness system** that maps to the kernel's standard nice values (-20 to +19), combined with **normalized latency criticality** scoring for intelligent task prioritization.
 
 The scheduler organizes tasks into three distinct queues based on their virtual nice value:
 
-- **LC (Latency-Critical) Queue**: virt_nice -50 to -20, 500μs time slices
-- **NORMAL Queue**: virt_nice -19 to +10, 1000μs time slices
-- **HOG Queue**: virt_nice +11 to +49, 3000μs time slices
+- **LC (Latency-Critical) Queue**: virt_nice -20 to -10, 500μs time slices
+- **NORMAL Queue**: virt_nice -9 to +5, 1000μs time slices
+- **HOG Queue**: virt_nice +6 to +19, 3000μs time slices
 
-Tasks are automatically classified into these queues using heuristics that detect Steam games, desktop environment components (kwin, mutter, gnome-shell), input handling threads (evdev, libinput), audio processing (pipewire, pulseaudio), and kernel threads. Tasks can also be manually marked via the `SCX_TURBO=1` environment variable.
+Tasks are automatically classified into these queues using heuristics that detect Steam games, desktop environment components (kwin, mutter, gnome-shell), input handling threads (evdev, libinput), audio processing (pipewire, pulseaudio, wireplumber, speech-dispatcher), and kernel threads. Tasks can also be manually marked via the `SCX_TURBO` environment variable (any non-empty, non-"0" value).
 
 The BPF component runs entirely in kernel context and makes all scheduling decisions, while the minimal Rust userspace component handles CLI argument parsing, task classification polling, and statistics reporting.
 
 ## How It Works
 
+### Normalized Latency Criticality
+
+scx_happy calculates a **normalized latency criticality score** (0-1024) for each task based on behavioral patterns:
+
+- **Wait frequency**: Tasks that sleep frequently (waiting for events) score higher
+- **Wake frequency**: Tasks that wake others (producer behavior) score higher
+- **Runtime factor**: Shorter runtime bursts indicate more latency-critical behavior
+- **Context boosts**: Sync wakeups, IRQ-driven wakeups, and kernel threads receive additional boosts
+
+**Cross-Queue Promotion:**
+Tasks with normalized_lat_cri >= 768 (75th percentile) can be promoted to the LC queue range regardless of their initial classification. This ensures that latency-critical tasks discovered at runtime receive appropriate scheduling priority.
+
+**Waker/Wakee Inheritance:**
+By default, tasks inherit latency criticality from their waker and pass it to tasks they wake, helping propagate criticality through producer-consumer chains. Use `--disable-lat-cri-inheritance` to disable this.
+
+Use `--disable-lat-cri` to disable the entire lat_cri mechanism and rely solely on dynamic interactive scoring.
+
 ### Virtual Niceness and WFQ
 
-The virtual niceness system maps the extended -50 to +49 range onto the kernel's existing nice-to-weight conversion table. The weight calculation follows the standard Linux weight table where nice 0 has weight 1024 and values range from 88761 (nice -20) down to 15 (nice +19).
+The virtual niceness system uses the standard Linux nice range (-20 to +19) mapped onto the kernel's existing nice-to-weight conversion table. The weight calculation follows the standard Linux weight table where nice 0 has weight 1024 and values range from 88761 (nice -20) down to 15 (nice +19).
 
 Within each queue, tasks are scheduled using WFQ principles. The virtual slice (vslice) for a task is calculated as:
 
@@ -67,6 +84,8 @@ Every 10ms (configurable via `--adjust-interval-us`), the scheduler recalculates
 
 Tasks with scores above the interactive threshold (default 700) have their virtual nice value adjusted toward more favorable values, limited to maximum changes of 5 units per adjustment period for smooth transitions.
 
+The final virt_nice is a weighted blend (default 60% lat_cri, 40% interactive score, configurable via `--lat-cri-weight-pct`) when latency criticality is enabled.
+
 ### HOG Demotion and Promotion
 
 **Demotion:**
@@ -84,6 +103,20 @@ HOG tasks can be promoted back to NORMAL through a sophisticated lag decay mecha
   4. The task shows interactive behavior patterns (wait frequency above threshold)
 
 This decay mechanism allows batch tasks that periodically sleep (e.g., checking for work, I/O wait) to gradually become eligible for promotion back to NORMAL, while true CPU hogs remain in the HOG queue. Use `--disable-hog-lag-decay` to disable this promotion mechanism.
+
+### Task Classification
+
+The scheduler automatically detects latency-critical tasks by:
+
+1. **Environment Variables** (checked for ALL processes):
+   - `SCX_TURBO` - Any non-empty, non-"0" value marks the task for LC priority
+   - `SteamGameId=` or `STEAM_GAME=` - Marks Steam games for LC priority
+
+2. **Process Name Patterns**:
+   - DE components: `kwin`, `mutter`, `gnome-shell`, `plasmashell`, etc.
+   - Input handlers: `fcitx`, `ibus`, `evdev`, `libinput`
+   - Audio processing: `pipewire`, `pipewire-pulse`, `wireplumber`, `pulseaudio`, `speech-dispatcher`
+   - Kernel threads: Automatically detected
 
 ### Additional Features
 
@@ -103,15 +136,14 @@ This decay mechanism allows batch tasks that periodically sleep (e.g., checking 
 - Desktop usage with mixed interactive and batch workloads
 - Systems with heterogeneous CPU topologies (P-cores/E-cores, big.LITTLE)
 
-The scheduler's combination of fine-grained virtual niceness and dynamic adjustment ensures that latency-critical tasks maintain responsiveness even when CPU-intensive background work is present.
+The scheduler's combination of normalized latency criticality scoring and dynamic adjustment ensures that latency-critical tasks maintain responsiveness even when CPU-intensive background work is present.
 
 ## Production Ready?
 
-No. `scx_happy` is currently in the experimental schedulers directory and is under active development. While the underlying algorithms (EEVDF and WFQ) are well-established in scheduling theory, this specific implementation with virtual niceness extension and dynamic adjustment heuristics requires further testing and validation before production use.
+No. `scx_happy` is currently in the experimental schedulers directory and is under active development. While the underlying algorithms (EEVDF and WFQ) are well-established in scheduling theory, this specific implementation with latency criticality scoring and dynamic adjustment heuristics requires further testing and validation before production use.
 
 The experimental status reflects:
-- Novel dynamic adjustment heuristics that may need tuning
-- Extended nice value system that hasn't been widely tested
+- Novel latency criticality heuristics that may need tuning
 - Task classification heuristics that may need refinement
 - Limited real-world workload validation
 

@@ -29,27 +29,52 @@ enum happy_queue {
 	HAPPY_QUEUE_MAX,
 };
 
-/* Virtual nice range: -50 to 49 */
-#define HAPPY_VIRT_NICE_MIN (-50)
-#define HAPPY_VIRT_NICE_MAX 49
+/* Virtual nice range: -20 to 19 (standard Linux nice) */
+#define HAPPY_VIRT_NICE_MIN (-20)
+#define HAPPY_VIRT_NICE_MAX 19
 #define HAPPY_VIRT_NICE_DEFAULT 0
 
 /* Queue boundaries in virtual nice space */
-#define HAPPY_LC_MAX_VIRT_NICE (-20)
-#define HAPPY_LC_MIN_VIRT_NICE (-50)
-#define HAPPY_NORMAL_MAX_VIRT_NICE 10
-#define HAPPY_NORMAL_MIN_VIRT_NICE (-19)
-#define HAPPY_HOG_MAX_VIRT_NICE 49
-#define HAPPY_HOG_MIN_VIRT_NICE 11
+#define HAPPY_LC_MAX_VIRT_NICE (-10)       /* LC: -20 to -10 */
+#define HAPPY_LC_MIN_VIRT_NICE (-20)
+#define HAPPY_NORMAL_MAX_VIRT_NICE 5       /* NORMAL: -9 to 5 */
+#define HAPPY_NORMAL_MIN_VIRT_NICE (-9)
+#define HAPPY_HOG_MAX_VIRT_NICE 19         /* HOG: 6 to 19 */
+#define HAPPY_HOG_MIN_VIRT_NICE 6
 
-/* Default virtual nice values for classified tasks */
-#define HAPPY_VIRT_NICE_INPUT (-45) /* Highest LC priority */
-#define HAPPY_VIRT_NICE_TURBO (-35) /* SCX_TURBO tasks */
-#define HAPPY_VIRT_NICE_STEAM (-30) /* Steam games */
-#define HAPPY_VIRT_NICE_AUDIO (-28) /* Audio threads */
-#define HAPPY_VIRT_NICE_DE (-25) /* DE components */
-#define HAPPY_VIRT_NICE_KTHREAD (-10) /* Kernel threads (high-normal) */
-#define HAPPY_VIRT_NICE_HOG 30 /* Demoted to HOG queue */
+/* Default virtual nice values for classified tasks (within LC range) */
+#define HAPPY_VIRT_NICE_INPUT (-20)  /* Highest LC priority */
+#define HAPPY_VIRT_NICE_TURBO (-18)  /* SCX_TURBO tasks */
+#define HAPPY_VIRT_NICE_STEAM (-16)  /* Steam games */
+#define HAPPY_VIRT_NICE_AUDIO (-14)  /* Audio threads */
+#define HAPPY_VIRT_NICE_DE (-12)     /* DE components */
+#define HAPPY_VIRT_NICE_KTHREAD (-8) /* Kernel threads (high-normal, NORMAL queue) */
+#define HAPPY_VIRT_NICE_HOG 15       /* Demoted to HOG queue */
+
+/* ========== Latency Criticality Constants ========== */
+
+/* Scale for normalized latency criticality */
+#define HAPPY_LAT_CRI_SHIFT     10     /* 2^10 = 1024 */
+#define HAPPY_LAT_CRI_SCALE     1024   /* Normalized range [0, 1024] */
+
+/* Frequency caps for lat_cri calculation */
+#define HAPPY_LAT_CRI_FREQ_MAX  100000 /* Max frequency (100K/sec) */
+
+/* Runtime thresholds for lat_cri */
+#define HAPPY_LAT_CRI_RUNTIME_MAX_NS 1000000000ULL /* 1 second max */
+
+/* Weight boost constants for context-aware lat_cri */
+#define HAPPY_LC_WEIGHT_BOOST_WAKEUP    128   /* Regular wakeup boost */
+#define HAPPY_LC_WEIGHT_BOOST_SYNC      128   /* Additional for sync wakeup */
+#define HAPPY_LC_WEIGHT_BOOST_IRQ       512   /* IRQ-driven boost (highest) */
+#define HAPPY_LC_WEIGHT_BOOST_KTHREAD   64    /* Kernel thread boost */
+
+/* Inheritance shift for waker/wakee propagation */
+#define HAPPY_LC_INH_GIVER_SHIFT        3     /* 12.5% of giver's surplus */
+#define HAPPY_LC_INH_RECEIVER_SHIFT     2     /* 25% of receiver's lat_cri max */
+
+/* System stats update interval */
+#define HAPPY_SYS_STAT_INTERVAL_NS      10000000ULL /* 10ms */
 
 /* Task classification types for TGID maps */
 enum happy_task_type {
@@ -96,6 +121,12 @@ struct happy_stats {
 	/* NEW: Lag decay statistics */
 	u64 nr_hog_sleep_decayed; /* Times HOG sleep was decayed */
 	u64 nr_hog_promotion_checks; /* Promotion eligibility checks */
+	/* ========== Latency Criticality Statistics ========== */
+	u64 nr_lat_cri_calculations;  /* Total lat_cri calculations performed */
+	u64 nr_high_lat_cri_tasks;    /* Tasks with normalized_lat_cri > 768 */
+	u64 nr_lat_cri_inherited;     /* Times lat_cri was inherited from waker/wakee */
+	u32 sys_max_lat_cri;          /* System-wide max lat_cri for normalization */
+	u32 sys_avg_lat_cri;          /* System-wide avg lat_cri */
 };
 
 /* Domain configuration flags */

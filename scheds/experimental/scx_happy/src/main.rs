@@ -208,6 +208,31 @@ struct Opts {
     #[clap(long, default_value = "3")]
     hog_min_sleep_count: u32,
 
+    // === Latency Criticality Configuration ===
+    /// Disable latency criticality calculation.
+    ///
+    /// By default, scx_happy calculates a normalized latency criticality score [0-1024]
+    /// based on task behavior (wait frequency, wake frequency, runtime) and uses
+    /// it to derive virtual nice values alongside the interactive score.
+    /// Use this flag to disable the lat_cri mechanism entirely.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    disable_lat_cri: bool,
+
+    /// Weight percentage for lat_cri vs interactive score (0-100).
+    ///
+    /// Higher values prioritize latency criticality over interactive score.
+    /// For example, 60 means 60% lat_cri weight + 40% interactive score weight.
+    #[clap(long, default_value = "60")]
+    lat_cri_weight_pct: u32,
+
+    /// Disable waker/wakee latency criticality inheritance.
+    ///
+    /// By default, tasks inherit latency criticality from their waker and
+    /// pass it to tasks they wake. This helps propagate criticality through
+    /// producer-consumer chains. Use this flag to disable inheritance.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    disable_lat_cri_inheritance: bool,
+
     // === Output/Monitoring ===
     /// Enable verbose output, including libbpf details.
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
@@ -282,23 +307,32 @@ impl TaskClassifier {
             }
 
             // Classify by comm patterns - Audio
-            let audio_patterns = ["pipewire", "pulseaudio", "jackd", "alsa"];
+            let audio_patterns = [
+                "pipewire", "pipewire-pulse", "wireplumber",
+                "pulseaudio", "jackd", "pw-", "pw_",
+                "speech-dispatcher", "canberra",
+            ];
             for p in audio_patterns {
                 if comm.contains(p) {
                     self.audio_tgids.insert(pid);
                 }
             }
 
-            // Slow path: read environ only for Steam/SCX_TURBO detection
-            let needs_environ = comm.contains("wine") || comm.contains("game") || comm.is_empty();
-            if needs_environ {
-                if let Ok(environ) = fs::read_to_string(format!("/proc/{}/environ", pid)) {
-                    if environ.contains("SCX_TURBO=1") {
+            // Always check environ for SCX_TURBO and Steam detection
+            if let Ok(environ) = fs::read_to_string(format!("/proc/{}/environ", pid)) {
+                // Check for SCX_TURBO with any truthy value (non-empty, non-"0")
+                if let Some(start) = environ.find("SCX_TURBO=") {
+                    let value_start = start + "SCX_TURBO=".len();
+                    let remainder = &environ[value_start..];
+                    let value_end = remainder.find('\0').unwrap_or(remainder.len());
+                    let value = &remainder[..value_end];
+                    if !value.is_empty() && value != "0" {
                         self.scx_turbo_tgids.insert(pid);
                     }
-                    if environ.contains("SteamGameId=") || environ.contains("STEAM_GAME=") {
-                        self.steam_tgids.insert(pid);
-                    }
+                }
+                // Steam game detection
+                if environ.contains("SteamGameId=") || environ.contains("STEAM_GAME=") {
+                    self.steam_tgids.insert(pid);
                 }
             }
         }
@@ -464,6 +498,10 @@ fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
         same_queue_preemptions,
         hog_sleep_decayed,
         hog_promotion_checks,
+        // Latency criticality stats
+        lat_cri_calculations,
+        high_lat_cri_tasks,
+        lat_cri_inherited,
     ) = if let Some(bss) = skel.maps.bss_data.as_ref() {
         (
             bss.nr_lc_dispatches,
@@ -479,9 +517,13 @@ fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
             bss.nr_same_queue_preemptions,
             bss.nr_hog_sleep_decayed,
             bss.nr_hog_promotion_checks,
+            // Latency criticality
+            bss.nr_lat_cri_calculations,
+            bss.nr_high_lat_cri_tasks,
+            bss.nr_lat_cri_inherited,
         )
     } else {
-        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     };
 
     let total_dispatches = lc + normal + hog;
@@ -510,6 +552,10 @@ fn print_scheduler_stats(skel: &BpfSkel, classifier: &TaskClassifier) {
     info!(
         "HOG Lag Decay: sleep_decayed={}, promotion_checks={}",
         hog_sleep_decayed, hog_promotion_checks
+    );
+    info!(
+        "Latency Criticality: calculations={}, high_lat_cri={}, inherited={}",
+        lat_cri_calculations, high_lat_cri_tasks, lat_cri_inherited
     );
 }
 
@@ -621,6 +667,10 @@ fn main() -> Result<()> {
     rodata.hog_decay_interval_ns = opts.hog_decay_interval_us * 1000;
     rodata.hog_min_sleep_duration_ns = opts.hog_min_sleep_duration_us * 1000;
     rodata.hog_min_sleep_count = opts.hog_min_sleep_count;
+    // ========== Latency Criticality Configuration ==========
+    rodata.lat_cri_enabled = !opts.disable_lat_cri;
+    rodata.lat_cri_weight_pct = opts.lat_cri_weight_pct;
+    rodata.lat_cri_inheritance = !opts.disable_lat_cri_inheritance;
 
     // Load the skeleton
     let mut skel = scx_ops_load!(open_skel, happy_ops, uei)?;
