@@ -3621,6 +3621,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "scx_astro"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_complete",
+ "crossbeam",
+ "ctrlc",
+ "libbpf-rs",
+ "log",
+ "nix 0.29.0",
+ "scx_cargo",
+ "scx_stats",
+ "scx_stats_derive",
+ "scx_utils",
+ "serde",
+ "simplelog",
+]
+
+[[package]]
 name = "scx_beerland"
 version = "1.1.0"
 dependencies = [
