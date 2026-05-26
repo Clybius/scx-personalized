@@ -14,7 +14,7 @@ The scheduler uses a **multi-lane DSQ containment model** where tasks are classi
 
 Three novel features differentiate `scx_astro`:
 
-1. **SRPT-inspired prioritization** within the normal lane, using vtime scaling to prefer shorter tasks.
+1. **SRPT-inspired prioritization** within the normal and compute lanes, using a transient vtime bonus to prefer shorter tasks.
 2. **Waker-boost chains** that propagate interactive priority to tasks woken by interactive threads.
 3. **Dynamic lane routing** with hysteresis, allowing tasks to move between lanes as their behavior changes without thrashing.
 
@@ -24,25 +24,23 @@ Three novel features differentiate `scx_astro`:
 
 ### 2.1 DSQ IDs and Purposes
 
-`scx_astro` defines five global DSQ lanes plus per-CPU local DSQs for direct dispatch:
+`scx_astro` defines five global DSQ lanes. There is no dedicated per-CPU DSQ ID base; the direct-local fast path uses the standard `SCX_DSQ_LOCAL_ON | cpu`.
 
 | DSQ Name | ID | Purpose | Preempt? | Slice |
 |----------|----|---------|----------|-------|
 | `ASTRO_INTERACTIVE_DSQ` | 1020 | Latency-critical tasks (UI, audio, input handlers) | Yes | 50–200 µs |
 | `ASTRO_WAKER_BOOST_DSQ` | 1021 | Temporary boost lane for wakees of interactive tasks | Yes | 100 µs |
-| `ASTRO_NORMAL_DSQ` | 1022 | General tasks; SRPT-ordered via vtime scaling | No (default) | 0.5–2 ms |
-| `ASTRO_COMPUTE_DSQ` | 1023 | Long-running CPU-bound jobs | No | 2–5 ms |
-| `ASTRO_BACKGROUND_DSQ` | 1024 | Contained/throughput tasks; starvation-fair | No | 100–500 µs |
-| `ASTRO_LOCAL_CPU_BASE \| cpu` | 0x40000000 + cpu | Per-CPU DSQ for locality-optimized direct dispatch | N/A | Varies |
+| `ASTRO_NORMAL_DSQ` | 1022 | General tasks; SRPT-ordered via transient vtime bonus | No (default) | 0.5–2 ms |
+| `ASTRO_COMPUTE_DSQ` | 1023 | Long-running CPU-bound jobs | No | 3 ms default (tunable, min 50 µs) |
+| `ASTRO_BACKGROUND_DSQ` | 1024 | Contained/throughput tasks; starvation-fair | No | 500 µs default (tunable, min 50 µs) |
 
 ### 2.2 Global vs. Per-CPU DSQs
 
-Following the pattern from `scx_flow`, `scx_astro` uses a **hybrid approach**:
+`scx_astro` uses **global DSQs** for all five lanes. This ensures that any CPU can steal work from any lane, providing natural load balancing and preventing stranding of interactive tasks on idle CPUs.
 
-- **Global DSQs** for the five lanes: this ensures that any CPU can steal work from any lane, providing natural load balancing and preventing stranding of interactive tasks on idle CPUs.
-- **Per-CPU local DSQs** (`ASTRO_LOCAL_CPU_BASE | cpu`) are created at init time and used as a fast path when `select_cpu()` finds an idle target CPU. The task is inserted directly into `SCX_DSQ_LOCAL_ON | cpu` (or the per-CPU dedicated DSQ) to maximize cache locality.
+The direct-local fast path (when `select_cpu()` finds an idle target CPU) inserts tasks directly into the standard `SCX_DSQ_LOCAL_ON | cpu`, not a custom per-CPU DSQ. Only the five global DSQs are created at `init()` time.
 
-Rationale: Global DSQs are essential for the multi-lane containment model because a task classified as interactive should be runnable on any available CPU, not just its last CPU. Per-CPU DSQs are used only for the direct-local fast path when wake_cpu is idle.
+Rationale: Global DSQs are essential for the multi-lane containment model because a task classified as interactive should be runnable on any available CPU, not just its last CPU. `SCX_DSQ_LOCAL_ON` is used only for the direct-local fast path when `wake_cpu` is idle.
 
 ### 2.3 Dispatch Priority Order
 
@@ -82,7 +80,7 @@ To prevent background and compute tasks from starving indefinitely, `scx_astro` 
 - `contained_starvation_rounds`: counts consecutive dispatches since a background task last ran.
 - `shared_starvation_rounds`: counts consecutive dispatches since a normal/compute task last ran.
 
-When `high_priority_burst_rounds` exceeds `ASTRO_HIGH_PRIO_BURST_MAX` (default 4), the scheduler is forced to service lower-priority lanes on the next dispatch. Similarly, when `contained_starvation_rounds` or `shared_starvation_rounds` exceed their maxima, tasks from those lanes are promoted to the head of their DSQs (`SCX_ENQ_HEAD`) and the dispatch order may be overridden.
+When `high_priority_burst_rounds` exceeds `ASTRO_HIGH_PRIO_BURST_MAX` (default 4), the scheduler is forced to service lower-priority lanes on the next dispatch. Similarly, when `contained_starvation_rounds` or `shared_starvation_rounds` exceed their maxima, the dispatch order is overridden to service those lanes sooner. No `SCX_ENQ_HEAD` promotion is used in the current implementation; starvation rescue affects only the dispatch consumption order.
 
 This design is directly inspired by `scx_flow`'s starvation-rescue mechanism, which has proven effective in production.
 
@@ -126,10 +124,9 @@ static __always_inline void calc_lat_cri(struct task_struct *p,
     else
         runtime_ft = 1;
 
-    /* Context weight boosts (sync wake, hardirq, kthread, affinitized) */
+    /* Context weight boosts (sync wake, kthread, affinitized) */
     if (taskc->is_wakeup)       weight_ft += ASTRO_LC_WEIGHT_BOOST_REGULAR;
     if (taskc->is_sync_wakeup)  weight_ft += ASTRO_LC_WEIGHT_BOOST_REGULAR;
-    if (taskc->woken_by_hardirq) weight_ft += ASTRO_LC_WEIGHT_BOOST_HIGHEST;
     if (is_kthread(p))          weight_ft += ASTRO_LC_WEIGHT_BOOST_MEDIUM;
     if (p->nr_cpus_allowed == 1) weight_ft += ASTRO_LC_WEIGHT_BOOST_MEDIUM;
 
@@ -139,14 +136,6 @@ static __always_inline void calc_lat_cri(struct task_struct *p,
     u64 log_wwf = astro_log2_u64(wait_ft * wake_ft);
     u64 lat_cri = log_wwf + astro_log2_u64(runtime_ft * weight_ft);
     lat_cri = lat_cri * lat_cri;
-
-    /* Waker/wakee propagation */
-    u64 giver = (u64)taskc->lat_cri_waker + (u64)taskc->lat_cri_wakee;
-    if (giver > (2 * lat_cri)) {
-        u64 giver_inh = (giver - (2 * lat_cri)) >> ASTRO_LC_INH_GIVER_SHIFT;
-        u64 receiver_max = lat_cri >> ASTRO_LC_INH_RECEIVER_SHIFT;
-        lat_cri += min(giver_inh, receiver_max);
-    }
 
     taskc->lat_cri = (u32)min(lat_cri, (u64)U32_MAX);
     taskc->normalized_lat_cri = (u32)((lat_cri * 1024ULL) / (1024ULL * 1024ULL));
@@ -192,7 +181,7 @@ SCX_ASTRO=interactive ./my-game-engine
 SCX_ASTRO=background ./long-batch-job
 ```
 
-The userspace component (Rust) scans `/proc/*/environ` at a configurable interval (default 2 seconds), parses `SCX_ASTRO=<profile>`, and writes the override into a BPF hash map `tgid_profile_map`:
+The BPF map `tgid_profile_map` is defined to receive explicit overrides:
 
 ```c
 struct {
@@ -213,14 +202,16 @@ else
     profile = auto_classify_profile(p, taskc);
 ```
 
-Rationale: Environment variables are inherited by child processes, so setting `SCX_ASTRO` on a shell or launcher automatically applies to the entire process tree. This is simpler than per-task syscalls and matches the documented design of `scx_turbo`.
+> **Status:** The BPF-side lookup is fully implemented, but the userspace component that scans `/proc/*/environ` and populates `tgid_profile_map` is **not yet implemented**. Auto-classification works independently. A future version will add a userspace scanning thread (or use `libbpf_rs::MapHandle` from a detached thread) to push overrides into BPF.
+
+Rationale: Environment variables are inherited by child processes, so setting `SCX_ASTRO` on a shell or launcher would automatically apply to the entire process tree. This is simpler than per-task syscalls and matches the documented design of `scx_turbo`.
 
 ### 3.3 Profile System and Default Behaviors
 
 | Profile | ID | Default Behavior |
 |---------|----|------------------|
 | `ASTRO_PROFILE_INTERACTIVE` (0) | Short slices, head enqueue, preemptive. Fast lane. | Auto-detected via high lat_cri + short runtime + high sleep/wake frequency |
-| `ASTRO_PROFILE_NORMAL` (1) | Standard slices, vtime-ordered with SRPT scaling. | Default for tasks that don't fit other profiles |
+| `ASTRO_PROFILE_NORMAL` (1) | Standard slices, vtime-ordered with SRPT bonus. | Default for tasks that don't fit other profiles |
 | `ASTRO_PROFILE_COMPUTE` (2) | Long slices, throughput lane. | Auto-detected via long runtime + low sleep/wake frequency |
 | `ASTRO_PROFILE_BACKGROUND` (3) | Tiny slices, contained lane. | Auto-detected via high hog_score or explicit override |
 
@@ -253,53 +244,49 @@ if (taskc->profile_hysteresis >= ASTRO_HYSTERESIS_THRESHOLD) {
 
 ### 4.1 SRPT-Inspired Prioritization
 
-**SRPT (Shortest Remaining Processing Time)** is theoretically optimal for mean response time, but it requires knowing the exact remaining runtime, which is impossible. `scx_astro` approximates SRPT within the **NORMAL** lane using vtime scaling:
+**SRPT (Shortest Remaining Processing Time)** is theoretically optimal for mean response time, but it requires knowing the exact remaining runtime, which is impossible. `scx_astro` approximates SRPT within the **NORMAL** and **COMPUTE** lanes using a **transient vtime bonus** (negative offset) at enqueue time:
 
 ```c
-static __always_inline u64 srpt_vtime_scale(u64 vtime, u64 avg_runtime)
+static __always_inline u64 srpt_bonus_ns(u64 avg_runtime)
 {
-    u64 threshold = tune_srpt_threshold_ns; /* default 500us */
+    u64 threshold = tune_srpt_threshold_ns; /* default 500 µs */
+    u64 max_bonus = ASTRO_SRPT_MAX_BONUS_NS; /* 1 ms */
     if (avg_runtime < threshold) {
-        /* Short tasks get 0.5x vtime -> appear earlier in EDF ordering */
-        vtime = (vtime * ASTRO_SRPT_VTIME_SCALE_NUM) / ASTRO_SRPT_VTIME_SCALE_DEN;
+        /* Short tasks get a bounded vtime subtraction -> appear earlier in EDF ordering */
+        u64 bonus = threshold - avg_runtime;
+        return min(bonus, max_bonus);
     }
-    return vtime;
+    return 0;
 }
 ```
 
-In `enqueue()`, tasks dispatched to `ASTRO_NORMAL_DSQ` or `ASTRO_COMPUTE_DSQ` use `scx_bpf_dispatch_vtime()`:
+In `astro_enqueue()`, tasks dispatched to `ASTRO_NORMAL_DSQ` or `ASTRO_COMPUTE_DSQ` use `scx_bpf_dsq_insert_vtime()`:
 
 ```c
 if (profile == ASTRO_PROFILE_NORMAL || profile == ASTRO_PROFILE_COMPUTE) {
-    vtime = srpt_vtime_scale(vtime, taskc->avg_runtime_ns);
-    scx_bpf_dispatch_vtime(p, dsq_id, slice_ns, vtime, enq_flags);
+    u64 bonus = srpt_bonus_ns(taskc->avg_runtime_ns);
+    vtime = vtime > bonus ? vtime - bonus : vtime;
+    scx_bpf_dsq_insert_vtime(p, dsq_id, slice_ns, vtime, enq_flags);
 } else {
-    scx_bpf_dispatch(p, dsq_id, slice_ns, enq_flags);
+    scx_bpf_dsq_insert(p, dsq_id, slice_ns, enq_flags);
 }
 ```
 
-This means that among tasks with similar accumulated vruntime, the one with shorter average runtime per schedule will be chosen first. This is particularly effective for bursty shell workloads where many short commands interleave with a few long builds.
+This means that among tasks with similar accumulated vruntime, the one with shorter average runtime per schedule will be chosen first. The bonus is **transient** (applied only at enqueue) so it does not permanently distort cumulative vruntime, preserving fairness over time. This is particularly effective for bursty shell workloads where many short commands interleave with a few long builds.
 
 ### 4.2 Waker-Boost Chains
 
 When an interactive task wakes another task (e.g., the compositor wakes a game thread, which wakes a shader compiler), the wakee receives a **temporary priority boost** into `ASTRO_WAKER_BOOST_DSQ`.
 
-Because `sched_ext` does not expose a `set_wakeup` struct_ops callback in the current kernel version, `scx_astro` implements this via a **heuristic approximation** using per-CPU timestamps:
+`scx_astro` implements waker-boost using **direct waker-wakee tracking** via `bpf_get_current_task_btf()` in `astro_runnable()`, which is called in the waker's context when it wakes another task:
 
 ```c
-void BPF_STRUCT_OPS(astro_running, struct task_struct *p)
-{
-    ...
-    if (cstate && taskc && taskc->current_profile == ASTRO_PROFILE_INTERACTIVE)
-        cstate->last_interactive_ts = now;
-    ...
-}
-
 void BPF_STRUCT_OPS(astro_runnable, struct task_struct *p, u64 enq_flags)
 {
     ...
-    if (cstate && cstate->last_interactive_ts > 0 &&
-        now - cstate->last_interactive_ts < ASTRO_WAKER_BOOST_DURATION_NS &&
+    struct task_struct *waker = bpf_get_current_task_btf();
+    struct astro_task_ctx *waker_taskc = lookup_task_ctx(waker);
+    if (waker_taskc && waker_taskc->current_profile == ASTRO_PROFILE_INTERACTIVE &&
         taskc->waker_boost_depth < ASTRO_WAKER_BOOST_MAX_CHAIN) {
         taskc->waker_boost_expire_ns = now + ASTRO_WAKER_BOOST_DURATION_NS;
         taskc->waker_boost_depth++;
@@ -308,14 +295,16 @@ void BPF_STRUCT_OPS(astro_runnable, struct task_struct *p, u64 enq_flags)
 }
 ```
 
-**How it works**: When an interactive task runs on a CPU, it stamps `last_interactive_ts` in the per-CPU state. When another task wakes up on that same CPU shortly after, `runnable()` detects the recent interactive execution and grants the wakee a temporary boost. This approximates the true waker-wakee relationship without requiring BPF trampolines on `try_to_wake_up`.
+**How it works**: When a task wakes another, `astro_runnable()` runs in the waker's context. If the waker is currently classified as `INTERACTIVE`, the wakee receives a temporary boost into `ASTRO_WAKER_BOOST_DSQ`. This provides exact waker-wakee tracking without BPF trampolines or heuristics.
 
 Key properties:
 - **Depth limit**: `ASTRO_WAKER_BOOST_MAX_CHAIN = 3` prevents infinite chain propagation (e.g., A wakes B wakes C wakes D...).
-- **Time limit**: `ASTRO_WAKER_BOOST_DURATION_NS = 2ms`. The boost expires after 2ms of wall-clock time, not CPU time, so a boosted task that doesn't run immediately loses its boost.
-- **Lane**: Boosted tasks go to `ASTRO_WAKER_BOOST_DSQ`, which is checked immediately after `ASTRO_INTERACTIVE_DSQ` in dispatch. They get `SCX_ENQ_HEAD` and may preempt.
+- **Time limit**: `ASTRO_WAKER_BOOST_DURATION_NS = 2 ms`. The boost expires after 2 ms of wall-clock time, not CPU time, so a boosted task that doesn't run immediately loses its boost.
+- **Lane**: Boosted tasks go to `ASTRO_WAKER_BOOST_DSQ`, which is checked immediately after `ASTRO_INTERACTIVE_DSQ` in dispatch. They receive `SCX_ENQ_PREEMPT` and may trigger preemption.
 
-Rationale: This is inspired by `scx_turbo`'s documented waker-boost design and `scx_lavd`'s latency-criticality propagation. The heuristic trades precision for portability: it works on current sched_ext kernels without requiring unstable tracepoint attachments. A future enhancement could attach a BPF trampoline to `try_to_wake_up` for exact waker-wakee tracking.
+> **Note on dead code**: `astro_cpu_state` contains a `last_interactive_ts` field that is updated in `astro_running()` but **never read** in the current implementation. It is a leftover from an earlier per-CPU heuristic approach that was replaced by the direct waker tracking above. It can be safely removed in a future cleanup.
+
+Rationale: This is inspired by `scx_turbo`'s documented waker-boost design and `scx_lavd`'s latency-criticality propagation. Using `bpf_get_current_task_btf()` provides precise waker identification with no additional kernel dependencies.
 
 ### 4.3 Dynamic Lane Routing
 
@@ -326,7 +315,7 @@ Tasks can move between lanes based on multiple triggers:
 | High lat_cri + short runtime detected | NORMAL | INTERACTIVE | `auto_classify_profile()` via hysteresis |
 | Budget exhaustion + high hog_score | NORMAL/COMPUTE | BACKGROUND | `hog_score` incremented on exhaustion |
 | Long sleep + positive budget refill | BACKGROUND | NORMAL | `hog_score` decay on short runs |
-| Explicit env var override | Any | Override profile | `tgid_profile_map` lookup |
+| Explicit env var override (planned) | Any | Override profile | `tgid_profile_map` lookup (BPF ready; userspace scanning pending) |
 
 The `hog_score` mechanism (borrowed from `scx_flow`) provides a robust signal for compute-to-background transitions:
 
@@ -349,13 +338,13 @@ When `hog_score >= ASTRO_HOG_SCORE_CONTAIN` (3), the task is classified as `BACK
 
 ### 5.1 Default Slices per Lane
 
-| Lane | Default Slice | Range | Behavior |
-|------|---------------|-------|----------|
-| Interactive | 150 µs | 50–200 µs | Short and responsive; tuned for 60–240Hz frame deadlines |
+| Lane | Default Slice | BPF Clamp Range | Behavior |
+|------|---------------|-----------------|----------|
+| Interactive | 150 µs | 50–200 µs | Short and responsive; tuned for 60–240 Hz frame deadlines |
 | Waker Boost | 100 µs | Fixed | Temporary; just enough to make progress before lane re-evaluation |
 | Normal | 1 ms | 0.5–2 ms | Scales slightly with system load |
-| Compute | 3 ms | Fixed | Long enough to amortize scheduling overhead |
-| Background | 500 µs | 100–800 µs | Tiny to ensure frequent yield points; tunable via autotuner |
+| Compute | 3 ms | ≥ 50 µs (no upper clamp in BPF; autotuner allows up to 10 ms) | Long enough to amortize scheduling overhead |
+| Background | 500 µs | ≥ 50 µs (no upper clamp in BPF) | Tiny to ensure frequent yield points; tunable via autotuner |
 
 ### 5.2 Slice Scaling Under Load
 
@@ -378,7 +367,7 @@ enum AutoTuneMode {
 
 ### 5.3 Background Task Slices
 
-Background tasks get **tiny slices by design** (default 500 µs, min 100 µs). The rationale is that background work (compilers, backups, indexing) should make slow, steady progress without creating noticeable latency spikes. The frequent yield points ensure that if an interactive task arrives, it will be scheduled within ~500 µs.
+Background tasks get **tiny slices by design** (default 500 µs, min 50 µs). The rationale is that background work (compilers, backups, indexing) should make slow, steady progress without creating noticeable latency spikes. The frequent yield points ensure that if an interactive task arrives, it will be scheduled within ~500 µs.
 
 ---
 
@@ -453,7 +442,7 @@ Preemption is triggered in `astro_enqueue()` when:
 
 ```c
 if (profile == ASTRO_PROFILE_INTERACTIVE || profile == ASTRO_PROFILE_WAKER_BOOST) {
-    enq_flags |= SCX_ENQ_HEAD;
+    enq_flags |= SCX_ENQ_PREEMPT;
     if (target_cpu >= 0 && !taskc->wake_cpu_idle) {
         scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT);
         preempts++;
@@ -462,7 +451,7 @@ if (profile == ASTRO_PROFILE_INTERACTIVE || profile == ASTRO_PROFILE_WAKER_BOOST
 }
 ```
 
-The `SCX_ENQ_HEAD` flag ensures the task is at the front of its DSQ. The `SCX_KICK_PREEMPT` IPI forces the target CPU to reschedule immediately. Together, they achieve sub-millisecond preemption latency for interactive tasks.
+The `SCX_ENQ_PREEMPT` flag allows the task to preempt the currently running task on its target CPU. The `SCX_KICK_PREEMPT` IPI forces the target CPU to reschedule immediately. Together, they achieve sub-millisecond preemption latency for interactive tasks.
 
 ### 7.2 IPI Kicking Patterns
 
@@ -502,13 +491,9 @@ struct Opts {
     #[clap(long)]
     no_autotune: bool,
 
-    /// Disable /proc environment scanning.
-    #[clap(long)]
-    no_autoscan: bool,
-
-    /// Milliseconds between /proc scans.
-    #[clap(long, default_value = "2000")]
-    scan_interval_ms: u64,
+    /// Print version and exit.
+    #[clap(short = 'V', long)]
+    version: bool,
 
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     libbpf: LibbpfOpts,
@@ -529,35 +514,7 @@ The `Metrics` struct (exposed via `scx_stats`) tracks:
 
 ### 8.3 Auto-Detection Daemon
 
-The userspace thread scans `/proc/*/environ` for `SCX_ASTRO=<profile>`:
-
-```rust
-fn scan_proc_environ(skel: &mut BpfSkel, interval_ms: u64, shutdown: Arc<AtomicBool>) {
-    let mut known: HashMap<i32, u8> = HashMap::new();
-    while !shutdown.load(Ordering::Relaxed) {
-        let mut current_pids = Vec::new();
-        for entry in fs::read_dir("/proc").unwrap().flatten() {
-            let pid: i32 = entry.file_name().to_string_lossy().parse().ok()?;
-            let environ = fs::read_to_string(format!("/proc/{}/environ", pid)).unwrap_or_default();
-            if let Some(profile) = parse_profile_from_environ(&environ) {
-                current_pids.push(pid);
-                if known.get(&pid) != Some(&profile) {
-                    skel.maps.tgid_profile_map.update(
-                        &pid.to_ne_bytes(),
-                        &astro_tgid_profile { profile }.as_bytes(),
-                        libbpf_rs::MapFlags::ANY,
-                    ).ok();
-                    known.insert(pid, profile);
-                }
-            }
-        }
-        known.retain(|pid, _| current_pids.contains(pid));
-        thread::sleep(Duration::from_millis(interval_ms));
-    }
-}
-```
-
-Note: In the current skeleton, the scan thread is not spawned because `BpfSkel` is not `Send`. A production implementation would extract the map FD after load and use `libbpf_rs::MapHandle` in the scan thread.
+> **Status:** The `/proc/*/environ` scanning thread is **not implemented**. The `tgid_profile_map` BPF hash map is defined and checked in `effective_profile()`, but no userspace code writes to it. A future implementation would extract the map FD after load and use `libbpf_rs::MapHandle` in a detached thread to scan `/proc/*/environ` at a configurable interval (e.g., 2 seconds) and push overrides into BPF.
 
 ### 8.4 Tunables
 
@@ -600,7 +557,6 @@ clap = { version = "4", features = ["derive"] }
 libbpf-rs = "=0.26.2"
 scx_stats = { path = "../../../rust/scx_stats" }
 scx_utils = { path = "../../../rust/scx_utils" }
-nix = { version = "0.29", features = ["process"] }
 
 [build-dependencies]
 scx_cargo = { path = "../../../rust/scx_cargo" }
@@ -643,13 +599,17 @@ Without hysteresis, a task that alternates between short and long runs (e.g., a 
 
 A threshold of 3 events was chosen empirically: it filters out single anomalies while responding to true behavioral changes within ~1-2ms.
 
-### 10.4 Why vtime Scaling for SRPT Instead of Sorted DSQs?
+### 10.4 Why vtime Bonus Subtraction for SRPT Instead of Sorted DSQs?
 
-True SRPT would require sorting tasks by estimated remaining runtime. BPF does not allow arbitrary sorting in DSQs. `scx_bpf_dispatch_vtime()` provides EDF ordering by virtual time. By scaling the vtime of short tasks downward, we approximate "short tasks go first" within the existing EDF framework without requiring new kernel mechanisms.
+True SRPT would require sorting tasks by estimated remaining runtime. BPF does not allow arbitrary sorting in DSQs. `scx_bpf_dsq_insert_vtime()` provides EDF ordering by virtual time.
+
+The original design used vtime *scaling* (multiplying short-task vtime by 0.5x). However, scaling permanently distorts cumulative vruntime, causing long-term fairness drift: a task that is "short" once will retain a permanently lower vtime base, giving it scheduling priority forever.
+
+The current implementation uses a **transient bonus subtraction** (`vtime = vtime - bonus`) applied only at enqueue time. This achieves the same "short tasks go first" effect within the EDF framework, but the bonus does not accumulate: after the task runs, its next enqueue starts from its true cumulative vruntime. This preserves long-term fairness while still approximating SRPT for mean response time.
 
 ### 10.5 Why Not Use `scx_rustland` for Userspace Scheduling?
 
-`scx_rustland` offloads all scheduling decisions to userspace, providing maximum flexibility. However, it adds ~1-3 µs of overhead per schedule. For `scx_astro`, the classification logic is simple enough to fit entirely in BPF, and the hot paths (enqueue, dispatch, select_cpu) must run in kernel context to achieve sub-100µs latency targets. Userspace is used only for slow-path tasks: autotuning, environment scanning, and statistics.
+`scx_rustland` offloads all scheduling decisions to userspace, providing maximum flexibility. However, it adds ~1-3 µs of overhead per schedule. For `scx_astro`, the classification logic is simple enough to fit entirely in BPF, and the hot paths (enqueue, dispatch, select_cpu) must run in kernel context to achieve sub-100µs latency targets. Userspace is used only for slow-path tasks: autotuning and statistics. (Environment scanning is planned but not yet implemented.)
 
 ---
 
@@ -708,7 +668,9 @@ stress-ng --cpu 1 --timeout 10s &
 
 Observe via `scxtop` or stats that short sleepers (`srpt_short_tasks`) are disproportionately represented in normal dispatches compared to their CPU share.
 
-### 11.5 Explicit Override Test
+### 11.5 Explicit Override Test (Future)
+
+Once the `/proc` scanning userspace component is implemented:
 
 ```bash
 SCX_ASTRO=interactive ./latency-test &
@@ -736,7 +698,7 @@ scheds/experimental/scx_astro/
 ├── DESIGN.md             # This document
 └── src/
     ├── main.rs           # Userspace: CLI, skeleton loading, autotuner,
-    │                     #   stats server, /proc scan thread (stubbed)
+    │                     #   stats server, event loop
     ├── stats.rs          # scx_stats Metrics struct, server_data(), monitor()
     ├── bpf_intf.rs       # include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"))
     ├── bpf_skel.rs       # include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"))
@@ -750,14 +712,14 @@ scheds/experimental/scx_astro/
 
 | File | Lines (approx) | Key Contents |
 |------|----------------|--------------|
-| `src/bpf/main.bpf.c` | ~550 | Core scheduler logic. Maps, helpers, all 12 struct_ops callbacks. |
-| `src/bpf/intf.h` | ~120 | Shared constants and structs between BPF and Rust. |
-| `src/main.rs` | ~400 | CLI parsing, skeleton init, autotuner, /proc scanning, event loop. |
-| `src/stats.rs` | ~200 | scx_stats metrics definitions and formatting. |
+| `src/bpf/main.bpf.c` | ~990 | Core scheduler logic. Maps, helpers, all 12 struct_ops callbacks. |
+| `src/bpf/intf.h` | ~170 | Shared constants and structs between BPF and Rust. |
+| `src/main.rs` | ~510 | CLI parsing, skeleton init, autotuner, stats server, event loop. |
+| `src/stats.rs` | ~175 | scx_stats metrics definitions and formatting. |
 | `src/bpf_intf.rs` | ~10 | Boilerplate include for generated bindings. |
 | `src/bpf_skel.rs` | ~5 | Boilerplate include for generated skeleton. |
 | `build.rs` | ~25 | Standard BpfBuilder invocation. |
-| `Cargo.toml` | ~30 | Dependencies identical to scx_flow + `nix` for proc scanning. |
+| `Cargo.toml` | ~30 | Dependencies identical to scx_flow. |
 
 ---
 

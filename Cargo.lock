@@ -3631,7 +3631,6 @@ dependencies = [
  "ctrlc",
  "libbpf-rs",
  "log",
- "nix 0.29.0",
  "scx_cargo",
  "scx_stats",
  "scx_stats_derive",

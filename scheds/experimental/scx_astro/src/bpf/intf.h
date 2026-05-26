@@ -40,6 +40,7 @@ enum consts {
 
 	/* SRPT */
 	ASTRO_SRPT_THRESHOLD_NS		= (500ULL * NSEC_PER_USEC),
+	ASTRO_SRPT_MAX_BONUS_NS		= (1ULL * NSEC_PER_MSEC),
 	ASTRO_SRPT_VTIME_SCALE_NUM	= 1ULL,
 	ASTRO_SRPT_VTIME_SCALE_DEN	= 2ULL, /* 0.5x vtime for short tasks */
 
@@ -67,8 +68,7 @@ enum consts {
 	ASTRO_LC_WEIGHT_BOOST_HIGH	= 128ULL,
 	ASTRO_LC_WEIGHT_BOOST_MEDIUM	= 64ULL,
 	ASTRO_LC_WEIGHT_BOOST_REGULAR	= 32ULL,
-	ASTRO_LC_INH_GIVER_SHIFT	= 3ULL,
-	ASTRO_LC_INH_RECEIVER_SHIFT	= 2ULL,
+
 
 	/* Budget */
 	ASTRO_BUDGET_MAX_NS		= (2ULL * NSEC_PER_MSEC),
@@ -134,8 +134,6 @@ struct astro_task_ctx {
 
 	/* Latency criticality */
 	u32 lat_cri;
-	u32 lat_cri_waker;
-	u32 lat_cri_wakee;
 	u32 normalized_lat_cri;
 
 	/* Profile / lane */

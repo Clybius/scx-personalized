@@ -9,9 +9,6 @@ pub use bpf_intf::*;
 
 mod stats;
 
-use std::collections::HashMap;
-use std::fs;
-use std::io::Read;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -42,8 +39,6 @@ use scx_utils::UserExitInfo;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_astro";
-#[allow(dead_code)]
-const ENV_VAR_NAME: &str = "SCX_ASTRO";
 
 fn full_version() -> String {
     build_id::full_version(env!("CARGO_PKG_VERSION"))
@@ -71,14 +66,6 @@ struct Opts {
     /// Disable adaptive runtime tuning.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_autotune: bool,
-
-    /// Disable automatic /proc scanning for SCX_ASTRO environment overrides.
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    no_autoscan: bool,
-
-    /// Interval in milliseconds between /proc environment scans.
-    #[clap(long, default_value = "2000")]
-    scan_interval_ms: u64,
 
     /// Generate shell completions and exit.
     #[clap(long, value_name = "SHELL", hide = true)]
@@ -286,7 +273,8 @@ impl<'a> Scheduler<'a> {
         skel.struct_ops.astro_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
-            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
+            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP
+            | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
 
         let mut skel = scx_ops_load!(skel, astro_ops, uei)?;
         Self::write_tunables(
@@ -315,8 +303,8 @@ impl<'a> Scheduler<'a> {
         let data = skel.maps.data_data.as_mut().unwrap();
         data.tune_interactive_slice_ns = tunables.interactive_slice_us * 1000;
         data.tune_normal_slice_ns = tunables.normal_slice_us * 1000;
-        data.tune_compute_slice_ns = tunables.compute_slice_us * 1000;
-        data.tune_background_slice_ns = tunables.background_slice_us * 1000;
+        data.tune_compute_slice_ns = tunables.compute_slice_us.max(50).min(10000) * 1000;
+        data.tune_background_slice_ns = tunables.background_slice_us.max(50).min(10000) * 1000;
 
         let bss_data = skel.maps.bss_data.as_mut().unwrap();
         bss_data.autotune_mode = mode.as_u64();
@@ -428,9 +416,13 @@ impl<'a> Scheduler<'a> {
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             match req_ch.recv_timeout(Duration::from_millis(250)) {
-                Ok(()) => res_ch.send(self.get_metrics())?,
+                Ok(()) => {
+                    if let Err(e) = res_ch.send(self.get_metrics()) {
+                        log::warn!("stats send failed: {}", e);
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(e) => Err(e)?,
+                Err(e) => log::warn!("stats recv failed: {}", e),
             }
 
             if let Some(autotuner) = autotuner.as_mut() {
@@ -455,87 +447,6 @@ impl<'a> Scheduler<'a> {
 
         let _ = self._struct_ops.take();
         uei_report!(&self.skel, uei)
-    }
-}
-
-#[allow(dead_code)]
-fn parse_profile_from_environ(environ: &str) -> Option<u8> {
-    for item in environ.split('\0') {
-        if let Some(val) = item.strip_prefix(ENV_VAR_NAME) {
-            let val = val.strip_prefix("=")?;
-            let profile = match val {
-                "interactive" => bpf_intf::consts_ASTRO_PROFILE_INTERACTIVE as u8,
-                "normal" => bpf_intf::consts_ASTRO_PROFILE_NORMAL as u8,
-                "compute" => bpf_intf::consts_ASTRO_PROFILE_COMPUTE as u8,
-                "background" => bpf_intf::consts_ASTRO_PROFILE_BACKGROUND as u8,
-                _ => continue,
-            };
-            return Some(profile);
-        }
-    }
-    None
-}
-
-#[allow(dead_code)]
-fn scan_proc_environ(skel: &mut BpfSkel, interval_ms: u64, shutdown: Arc<AtomicBool>) {
-    let mut known: HashMap<i32, u8> = HashMap::new();
-    let interval = Duration::from_millis(interval_ms);
-
-    while !shutdown.load(Ordering::Relaxed) {
-        let mut current_pids: Vec<i32> = Vec::new();
-
-        if let Ok(entries) = fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                let pid: i32 = match name_str.parse() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-
-                let path = format!("/proc/{}/environ", pid);
-                let mut file = match fs::File::open(&path) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                let mut buf = Vec::new();
-                if file.read_to_end(&mut buf).is_err() {
-                    continue;
-                }
-                let environ = String::from_utf8_lossy(&buf);
-                if let Some(profile) = parse_profile_from_environ(&environ) {
-                    current_pids.push(pid);
-                    let old = known.get(&pid).copied();
-                    if old != Some(profile) {
-                        let key = pid.to_ne_bytes();
-                        let val = bpf_intf::astro_tgid_profile { profile };
-                        let val_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                &val as *const _ as *const u8,
-                                std::mem::size_of::<bpf_intf::astro_tgid_profile>(),
-                            )
-                        };
-                        if let Err(e) = skel.maps.tgid_profile_map.update(
-                            &key,
-                            val_bytes,
-                            libbpf_rs::MapFlags::ANY,
-                        ) {
-                            log::debug!("failed to update tgid_profile_map for {}: {}", pid, e);
-                        } else {
-                            known.insert(pid, profile);
-                            log::debug!("set profile={} for pid={}", profile, pid);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Remove stale entries
-        known.retain(|pid, _| current_pids.contains(pid));
-        // Note: we don't delete from BPF map on exit to keep it simple; stale entries
-        // are overwritten on reuse. A production version could use a cleanup pass.
-
-        std::thread::sleep(interval);
     }
 }
 
@@ -593,12 +504,6 @@ fn main() -> Result<()> {
 
     let mut open_object = MaybeUninit::<libbpf_rs::OpenObject>::uninit();
     let mut sched = Scheduler::init(&opts, &mut open_object)?;
-
-    // TODO: Spawn auto-scan thread for /proc environ scanning.
-    // This requires extracting map FDs from the loaded skeleton and using
-    // libbpf_rs::MapHandle in a separate thread, as BpfSkel is not Send.
-    // For now, explicit profile overrides can be set via the tgid_profile_map
-    // using bpftool or a small standalone helper.
 
     sched.run(shutdown, !opts.no_autotune)?;
     info!("Scheduler exited");

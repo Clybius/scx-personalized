@@ -43,7 +43,7 @@ struct {
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 256);
+	__uint(max_entries, 1024);
 	__type(key, pid_t);
 	__type(value, struct astro_tgid_profile);
 } tgid_profile_map SEC(".maps");
@@ -187,17 +187,7 @@ static __always_inline void calc_lat_cri(struct task_struct *p,
 	lat_cri = log_wwf + astro_log2_u64(runtime_ft * weight_ft);
 	lat_cri = lat_cri * lat_cri;
 
-	/* Waker/wakee propagation (boost chains) */
-	u64 giver = (u64)taskc->lat_cri_waker + (u64)taskc->lat_cri_wakee;
-	if (giver > (2 * lat_cri)) {
-		u64 giver_inh = (giver - (2 * lat_cri)) >> ASTRO_LC_INH_GIVER_SHIFT;
-		u64 receiver_max = lat_cri >> ASTRO_LC_INH_RECEIVER_SHIFT;
-		lat_cri += min(giver_inh, receiver_max);
-	}
-
 	taskc->lat_cri = (u32)min(lat_cri, (u64)U32_MAX);
-	taskc->lat_cri_waker = 0;
-	taskc->lat_cri_wakee = 0;
 
 	/* Normalize to [0, 1024] */
 	u64 max_cri = 1024ULL * 1024ULL; /* lat_cri max before sqrt scaling approx */
@@ -341,10 +331,18 @@ static __always_inline u64 profile_slice_ns(u8 profile)
 			slice = ASTRO_SLICE_NORMAL_MAX_NS;
 		return slice;
 	}
-	case ASTRO_PROFILE_COMPUTE:
-		return tune_compute_slice_ns;
-	case ASTRO_PROFILE_BACKGROUND:
-		return tune_background_slice_ns;
+	case ASTRO_PROFILE_COMPUTE: {
+		u64 slice = tune_compute_slice_ns;
+		if (slice < ASTRO_SLICE_MIN_NS)
+			slice = ASTRO_SLICE_MIN_NS;
+		return slice;
+	}
+	case ASTRO_PROFILE_BACKGROUND: {
+		u64 slice = tune_background_slice_ns;
+		if (slice < ASTRO_SLICE_MIN_NS)
+			slice = ASTRO_SLICE_MIN_NS;
+		return slice;
+	}
 	default:
 		return tune_normal_slice_ns;
 	}
@@ -385,21 +383,23 @@ static __always_inline u8 maybe_boost_profile(struct astro_task_ctx *taskc, u64 
 }
 
 /*
- * SRPT-inspired vtime scaling.
- * Short tasks (avg_runtime < threshold) get scaled-down vtime so they
- * are scheduled earlier within the normal/compute lanes.
+ * SRPT-inspired transient bonus. Short tasks get a bounded negative
+ * offset to their vtime at enqueue time, giving them earlier scheduling
+ * without permanently corrupting cumulative vtime.
  */
-static __always_inline u64 srpt_vtime_scale(u64 vtime, u64 avg_runtime)
+static __always_inline u64 srpt_bonus_ns(u64 avg_runtime)
 {
 	u64 threshold = tune_srpt_threshold_ns;
 	if (threshold == 0)
 		threshold = ASTRO_SRPT_THRESHOLD_NS;
 
 	if (avg_runtime < threshold) {
-		/* Scale vtime by 0.5 for short tasks */
-		vtime = (vtime * ASTRO_SRPT_VTIME_SCALE_NUM) / ASTRO_SRPT_VTIME_SCALE_DEN;
+		u64 bonus = threshold - avg_runtime;
+		if (bonus > ASTRO_SRPT_MAX_BONUS_NS)
+			bonus = ASTRO_SRPT_MAX_BONUS_NS;
+		return bonus;
 	}
-	return vtime;
+	return 0;
 }
 
 /*
@@ -512,6 +512,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(astro_init_task, struct task_struct *p,
 	taskc->wake_cpu = -1;
 	taskc->sleep_started_at = now;
 	taskc->budget_ns = 0;
+	taskc->last_run_at = now;
 
 	return 0;
 }
@@ -533,6 +534,7 @@ void BPF_STRUCT_OPS(astro_enable, struct task_struct *p)
 	taskc->wake_cpu = -1;
 	taskc->sleep_started_at = now;
 	taskc->budget_ns = 0;
+	taskc->last_run_at = now;
 }
 
 s32 BPF_STRUCT_OPS(astro_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
@@ -580,11 +582,9 @@ s32 BPF_STRUCT_OPS(astro_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wa
 void BPF_STRUCT_OPS(astro_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct astro_task_ctx *taskc;
-	struct astro_cpu_state *cstate;
 	u64 now;
 
 	taskc = lookup_task_ctx(p);
-	cstate = lookup_cpu_state();
 	if (!taskc)
 		return;
 
@@ -593,13 +593,13 @@ void BPF_STRUCT_OPS(astro_runnable, struct task_struct *p, u64 enq_flags)
 	if (taskc->sleep_started_at && now > taskc->sleep_started_at)
 		update_budget_on_wakeup(p, taskc, now);
 
-	/* Approximate waker-boost chain: if this CPU recently ran an interactive
-	 * task, grant the wakee a temporary boost. This is a heuristic in lieu
-	 * of a true waker-wakee tracking mechanism (e.g., BPF trampoline on
-	 * try_to_wake_up), which is not available via standard struct_ops.
+	/*
+	 * Waker-boost chain: if the waker task itself is interactive,
+	 * grant the wakee a temporary boost.
 	 */
-	if (cstate && cstate->last_interactive_ts > 0 &&
-	    now - cstate->last_interactive_ts < ASTRO_WAKER_BOOST_DURATION_NS &&
+	struct task_struct *waker = bpf_get_current_task_btf();
+	struct astro_task_ctx *waker_taskc = lookup_task_ctx(waker);
+	if (waker_taskc && waker_taskc->current_profile == ASTRO_PROFILE_INTERACTIVE &&
 	    taskc->waker_boost_depth < ASTRO_WAKER_BOOST_MAX_CHAIN) {
 		taskc->waker_boost_expire_ns = now + ASTRO_WAKER_BOOST_DURATION_NS;
 		taskc->waker_boost_depth++;
@@ -647,18 +647,18 @@ void BPF_STRUCT_OPS(astro_enqueue, struct task_struct *p, u64 enq_flags)
 	slice_ns = profile_slice_ns(profile);
 	dsq_id = profile_dsq_id(profile);
 
-	/* SRPT scaling for normal/compute lanes */
+	/* SRPT bonus for normal/compute lanes: short tasks get transient priority */
 	if ((profile == ASTRO_PROFILE_NORMAL || profile == ASTRO_PROFILE_COMPUTE) && taskc) {
-		u64 old_vtime = vtime;
-		vtime = srpt_vtime_scale(vtime, taskc->avg_runtime_ns);
-		if (vtime != old_vtime) {
+		u64 bonus = srpt_bonus_ns(taskc->avg_runtime_ns);
+		if (bonus > 0) {
+			vtime = vtime - bonus;
 			ASTRO_CPUSTAT_INC(cstate, srpt_short_tasks);
 		}
 	}
 
-	/* Interactive / waker-boost tasks get head insertion and may preempt */
+	/* Interactive / waker-boost tasks preempt incumbent tasks */
 	if (profile == ASTRO_PROFILE_INTERACTIVE || profile == ASTRO_PROFILE_WAKER_BOOST) {
-		enq_flags |= SCX_ENQ_HEAD;
+		enq_flags |= SCX_ENQ_PREEMPT;
 		if (target_cpu >= 0 && !taskc->wake_cpu_idle) {
 			scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT);
 			ASTRO_CPUSTAT_INC(cstate, preempts);
@@ -790,6 +790,8 @@ void BPF_STRUCT_OPS(astro_running, struct task_struct *p)
 
 	if (taskc) {
 		taskc->last_cpu = cpu;
+		if (taskc->last_run_at == 0)
+			taskc->last_run_at = now;
 		taskc->last_run_at = now;
 		taskc->is_wakeup = false;
 		taskc->is_sync_wakeup = false;
@@ -825,17 +827,32 @@ void BPF_STRUCT_OPS(astro_stopping, struct task_struct *p, bool runnable)
 		}
 		taskc->acc_runtime_ns += runtime_ns;
 
+		/* Charge consumed runtime to cumulative vtime for fair share */
+		if (runtime_ns > 0) {
+			p->scx.dsq_vtime += scale_by_task_weight_inverse(p, runtime_ns);
+		}
+
 		/* Budget exhaustion tracking */
 		exhausted = taskc->budget_ns > 0 &&
 		    taskc->budget_ns - (s64)runtime_ns <= 0;
 		if (exhausted) {
 			struct astro_cpu_state *cstate = lookup_cpu_state();
 			ASTRO_CPUSTAT_INC(cstate, budget_exhaustions);
-			if (taskc->hog_score < ASTRO_HOG_SCORE_MAX)
-				taskc->hog_score += ASTRO_HOG_SCORE_EXHAUST_STEP;
 		}
 
 		taskc->budget_ns = clamp_budget(taskc->budget_ns - (s64)runtime_ns);
+
+		/* Hog detection: penalize negative budget or slice overrun */
+		if (taskc->hog_score < ASTRO_HOG_SCORE_MAX) {
+			if (taskc->budget_ns <= 0)
+				taskc->hog_score += ASTRO_HOG_SCORE_EXHAUST_STEP;
+			if (runtime_ns > p->scx.slice)
+				taskc->hog_score += ASTRO_HOG_SCORE_EXHAUST_STEP;
+		}
+
+		/* Decay frequencies (EWMA-ish) so they don't grow monotonically */
+		taskc->wait_freq = (3 * taskc->wait_freq) / 4;
+		taskc->wake_freq = (3 * taskc->wake_freq) / 4;
 
 		/* Update frequencies heuristically */
 		if (!runnable) {
@@ -901,6 +918,55 @@ void BPF_STRUCT_OPS(astro_exit, struct scx_exit_info *info)
 	UEI_RECORD(uei, info);
 }
 
+void BPF_STRUCT_OPS(astro_tick, struct task_struct *p)
+{
+	struct astro_task_ctx *taskc = lookup_task_ctx(p);
+	u8 profile = taskc ? taskc->current_profile : ASTRO_PROFILE_NORMAL;
+	u64 slice = p->scx.slice;
+
+	/* Shrink slices for non-interactive tasks on each tick */
+	if (profile == ASTRO_PROFILE_COMPUTE || profile == ASTRO_PROFILE_BACKGROUND) {
+		if (slice > ASTRO_SLICE_MIN_NS)
+			p->scx.slice = slice / 2;
+	}
+}
+
+void BPF_STRUCT_OPS(astro_update_idle, s32 cpu, bool idle)
+{
+	struct astro_cpu_state *cstate = lookup_cpu_state();
+
+	if (cstate) {
+		if (idle) {
+			/* Reset interactive timestamp so old boosts don't linger */
+			cstate->last_interactive_ts = 0;
+		} else {
+			/* CPU going non-idle: if background is starved, kick idle CPUs */
+			if (cstate->contained_starvation_rounds >= ASTRO_CONTAINED_STARVATION_MAX)
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		}
+	}
+}
+
+void BPF_STRUCT_OPS(astro_cpu_online, s32 cpu)
+{
+	struct astro_cpu_state *cstate;
+	u32 key = 0;
+
+	cstate = bpf_map_lookup_elem(&cpu_state, &key);
+	if (cstate)
+		__builtin_memset(cstate, 0, sizeof(*cstate));
+}
+
+void BPF_STRUCT_OPS(astro_cpu_offline, s32 cpu)
+{
+	struct astro_cpu_state *cstate;
+	u32 key = 0;
+
+	cstate = bpf_map_lookup_elem(&cpu_state, &key);
+	if (cstate)
+		__builtin_memset(cstate, 0, sizeof(*cstate));
+}
+
 SCX_OPS_DEFINE(astro_ops,
 	       .select_cpu		= (void *)astro_select_cpu,
 	       .enqueue			= (void *)astro_enqueue,
@@ -910,6 +976,10 @@ SCX_OPS_DEFINE(astro_ops,
 	       .enable			= (void *)astro_enable,
 	       .running			= (void *)astro_running,
 	       .stopping		= (void *)astro_stopping,
+	       .tick			= (void *)astro_tick,
+	       .update_idle		= (void *)astro_update_idle,
+	       .cpu_online		= (void *)astro_cpu_online,
+	       .cpu_offline		= (void *)astro_cpu_offline,
        .init_task		= (void *)astro_init_task,
        .exit_task		= (void *)astro_exit_task,
        .set_cpumask		= (void *)astro_set_cpumask,
