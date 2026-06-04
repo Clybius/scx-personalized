@@ -8,6 +8,7 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod stats;
+mod proc_scanner;
 
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
@@ -67,6 +68,10 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_autotune: bool,
 
+    /// /proc environ scan interval in seconds (0 to disable).
+    #[clap(long, default_value = "2.0")]
+    override_scan_interval: f64,
+
     /// Generate shell completions and exit.
     #[clap(long, value_name = "SHELL", hide = true)]
     completions: Option<Shell>,
@@ -79,6 +84,7 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     _struct_ops: Option<libbpf_rs::Link>,
     stats_server: StatsServer<(), Metrics>,
+    override_scan_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,6 +267,7 @@ impl<'a> Scheduler<'a> {
     fn init(
         opts: &'a Opts,
         open_object: &'a mut MaybeUninit<libbpf_rs::OpenObject>,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
         try_set_rlimit_infinity();
 
@@ -284,6 +291,33 @@ impl<'a> Scheduler<'a> {
             0,
         );
 
+        // Spawn override scanner thread if enabled
+        let override_scan_thread = if opts.override_scan_interval > 0.0 {
+            let interval = Duration::from_secs_f64(opts.override_scan_interval);
+            let map = &skel.maps.tgid_profile_map;
+            match map.info().and_then(|info| {
+                libbpf_rs::MapHandle::from_map_id(info.info.id)
+            }) {
+                Ok(map_handle) => {
+                    let shutdown_clone = shutdown.clone();
+                    Some(std::thread::spawn(move || {
+                        let mut scanner = proc_scanner::OverrideScanner::new(
+                            map_handle,
+                            shutdown_clone,
+                            interval,
+                        );
+                        scanner.run();
+                    }))
+                }
+                Err(e) => {
+                    log::warn!("Failed to create MapHandle for tgid_profile_map, override scanner disabled: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let struct_ops = scx_ops_attach!(skel, astro_ops)?;
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
@@ -291,6 +325,7 @@ impl<'a> Scheduler<'a> {
             skel,
             _struct_ops: Some(struct_ops),
             stats_server,
+            override_scan_thread,
         })
     }
 
@@ -446,6 +481,11 @@ impl<'a> Scheduler<'a> {
         }
 
         let _ = self._struct_ops.take();
+
+        if let Some(handle) = self.override_scan_thread.take() {
+            let _ = handle.join();
+        }
+
         uei_report!(&self.skel, uei)
     }
 }
@@ -503,7 +543,7 @@ fn main() -> Result<()> {
     }
 
     let mut open_object = MaybeUninit::<libbpf_rs::OpenObject>::uninit();
-    let mut sched = Scheduler::init(&opts, &mut open_object)?;
+    let mut sched = Scheduler::init(&opts, &mut open_object, shutdown.clone())?;
 
     sched.run(shutdown, !opts.no_autotune)?;
     info!("Scheduler exited");

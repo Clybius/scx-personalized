@@ -356,6 +356,8 @@ static __always_inline u64 profile_dsq_id(u8 profile)
 	switch (profile) {
 	case ASTRO_PROFILE_INTERACTIVE:
 		return ASTRO_INTERACTIVE_DSQ;
+	case ASTRO_PROFILE_WAKER_BOOST:
+		return ASTRO_WAKER_BOOST_DSQ;
 	case ASTRO_PROFILE_NORMAL:
 		return ASTRO_NORMAL_DSQ;
 	case ASTRO_PROFILE_COMPUTE:
